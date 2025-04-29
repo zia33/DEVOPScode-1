@@ -66,15 +66,23 @@ enterprise deployments often require more dynamic templating based on environmen
 or project-specific requirements.   
 1.
 
-Cannot generate Terraform files.") return False terraform_dir = config.data.get("terraform_dir", "./terraform") os.makedirs(terraform_dir, exist_ok=True) # Generate `variables.tf` variables_tf_content = f""" variable "aws_region" {{ default = "{config.region}" }} variable "instance_count" {{ default = {config.instance_count} }} variable "instance_type" {{ default = "{config.data.get('test_instance_type', 't2.micro')}" }}…
 
-enterprise...-Claude.py
-Dependency Management: The script relies on external tools like Terraform being installed and available in the environment. An enterprise solution might benefit from including dependency checks or managing these dependencies more explicitly.
-Logging during Errors: While logs are uploaded to S3 on success and failure of Terraform commands, ensuring that logs are fully captured and uploaded before exiting on error could be more robust.
-In summary, the script provides a good foundation with essential features like logging, rollback, and automation. However, to be considered truly "enterprise ready," it would need enhancements in error handling, configuration validation, security practices (IAM roles), state locking, testing, and more flexible parameterization.
+Dependency Management: The script relies on external tools like Terraform being 
+installed and available in the environment. An enterprise solution might benefit 
+from including dependency checks or managing these dependencies more explicitly.
+Logging during Errors: While logs are uploaded to S3 on success and failure of 
+Terraform commands, ensuring that logs are fully captured and uploaded before 
+exiting on error could be more robust.
+In summary, the script provides a good foundation with essential features like 
+logging, rollback, and automation. However, to be considered truly 
+"enterprise ready," it would need enhancements in error handling, 
+configuration validation, security practices (IAM roles), state locking, 
+testing, and more flexible parameterization.
 
 
-Your script is already well-structured and functional, but to make it more robust, secure, scalable, and production-ready, here are key refactoring and enhancement recommendations:
+Your script is already well-structured and functional, but to make it more robust, 
+secure, scalable, and production-ready, here are key refactoring and enhancement 
+recommendations:
 
 ---
 
