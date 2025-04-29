@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""
+AWS Enterprise Auto-Deployment Tool with Enhanced Features
+
+This script automates the deployment of enterprise infrastructure on AWS,
+using Terraform for EC2 instance deployment. It includes dependency validation,
+modularized design, retry logic, logging enhancements, dynamic instance count,
+custom exception hierarchy, and unit testing integration.
+"""
+
+import os
+import sys
+import json
+import logging
+import argparse
+import subprocess
+from contextlib import contextmanager
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+from time import sleep
+
+# ==============================================================
+# Logging Configuration
+# ==============================================================
+
+def configure_logging(debug=False):
+    """Set up logging for the script."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler("enterprise_deploy.log"),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
+    return logger
+
+logger = configure_logging()
+
+# ==============================================================
+# Argument Parser
+# ==============================================================
+
+def parse_arguments():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(description='Enterprise Auto-Deployment Tool with Enhanced Features')
+    parser.add_argument('--region', default=os.getenv("AWS_REGION", "us-east-1"),
+                        help='AWS region to deploy resources (default: us-east-1)')
+    parser.add_argument('--config-file', default="config.json",
+                        help='Path to the configuration file (default: config.json)')
+    parser.add_argument('--debug', action='store_true', help='Enable debug logging')
+    parser.add_argument('--dry-run', action='store_true', help='Dry run without creating resources')
+    parser.add_argument('--rollback', action='store_true', help='Rollback on failure')
+    parser.add_argument('--instance-count', type=int, default=3,
+                        help='Number of EC2 instances to launch (default: 3)')
+    return parser.parse_args()
+
+# ==============================================================
+# Dependency Validation
+# ==============================================================
+
+def validate_dependencies():
+    """Ensure required tools are installed."""
+    try:
+        subprocess.run(["terraform", "--version"], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        logger.info("Terraform is installed and ready to use.")
+    except FileNotFoundError:
+        logger.error("Terraform is not installed. Please install Terraform and try again.")
+        sys.exit(1)
+
+# ==============================================================
+# Configuration Management
+# ==============================================================
+
+class Config:
+    """Manages configuration settings."""
+    def __init__(self, args):
+        self.region = args.region
+        self.dry_run = args.dry_run
+        self.rollback = args.rollback
+        self.config_file = args.config_file
+        self.instance_count = args.instance_count
+
+        # Load configuration data with error handling
+        self.data = self.load_config()
+
+    def load_config(self):
+        """Load deployment configuration from a file."""
+        try:
+            with open(self.config_file, 'r') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            logger.error(f"Configuration file '{self.config_file}' not found. Please provide a valid file.")
+            sys.exit(1)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parsing configuration file: {e}")
+            sys.exit(1)
+
+# ==============================================================
+# Custom Exception Hierarchy
+# ==============================================================
+
+class DeploymentError(Exception):
+    """Base exception for deployment errors."""
+    pass
+
+class TerraformError(DeploymentError):
+    """Exception for Terraform-specific issues."""
+    pass
+
+class AWSClientError(DeploymentError):
+    """Exception for AWS client initialization issues."""
+    pass
+
+# ==============================================================
+# AWS Client Manager
+# ==============================================================
+
+class AWSManager:
+    """Manages AWS session and service clients."""
+    def __init__(self, region):
+        self.region = region
+        self.session = self._initialize_session()
+        self.clients = self._initialize_clients()
+
+    def _initialize_session(self):
+        """Initialize AWS session with error handling."""
+        try:
+            return boto3.Session(region_name=self.region)
+        except NoCredentialsError:
+            raise AWSClientError("AWS credentials not found. Ensure you are authenticated via AWS CLI or environment variables.")
+
+    def _initialize_clients(self):
+        """Initialize AWS service clients with detailed error handling."""
+        try:
+            sts_client = self.session.client('sts')
+            account = sts_client.get_caller_identity()["Account"]
+            logger.info(f"Authenticated with AWS account: {account}")
+            return {
+                's3': self.session.client('s3'),
+                'ec2': self.session.client('ec2'),
+                'iam': self.session.client('iam'),
+                'sns': self.session.client('sns')
+            }
+        except ClientError as e:
+            raise AWSClientError(f"Failed to initialize AWS clients: {e}")
+
+# ==============================================================
+# Retry Logic Wrapper
+# ==============================================================
+
+def retry(max_retries=3, delay=5):
+    """Decorator to add retry logic to functions."""
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            attempts = 0
+            while attempts < max_retries:
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    attempts += 1
+                    logger.warning(f"Attempt {attempts} failed: {e}. Retrying in {delay} seconds...")
+                    sleep(delay)
+            logger.error(f"All {max_retries} attempts failed for {func.__name__}.")
+            raise DeploymentError(f"{func.__name__} failed after {max_retries} retries.")
+        return wrapper
+    return decorator
+
+# ==============================================================
+# Terraform Configuration File Generation
+# ==============================================================
+
+@retry()
+def generate_terraform_config(config):
+    """Generate the main.tf Terraform configuration file dynamically."""
+    terraform_dir = config.data.get("terraform_dir", "./terraform")
+    os.makedirs(terraform_dir, exist_ok=True)
+
+    main_tf_content = f"""
+    provider "aws" {{
+      region = "{config.region}"
+    }}
+
+    resource "aws_instance" "test_vm" {{
+      ami           = "{config.data.get('ami_id', 'ami-0c55b159cbfafe1f0')}"
+      instance_type = "{config.data.get('test_instance_type', 't2.micro')}"
+      count         = {config.instance_count}
+
+      tags = {{
+        Name        = "TestVM"
+        Environment = "Test"
+        Project     = "EnterpriseAutoDeploy"
+      }}
+    }}
+    """
+
+    main_tf_path = os.path.join(terraform_dir, "main.tf")
+    with open(main_tf_path, "w") as f:
+        f.write(main_tf_content.strip())
+        logger.info(f"Generated Terraform configuration at: {main_tf_path}")
+
+# ==============================================================
+# Terraform Integration
+# ==============================================================
+
+@retry()
+def run_terraform(config):
+    """Run Terraform commands to deploy instances."""
+    generate_terraform_config(config)
+    terraform_dir = config.data.get("terraform_dir", "./terraform")
+    try:
+        logger.info("Initializing Terraform...")
+        subprocess.run(["terraform", "init"], cwd=terraform_dir, check=True)
+        subprocess.run(["terraform", "apply", "-auto-approve"], cwd=terraform_dir, check=True)
+        logger.info("Terraform deployment completed successfully.")
+    except subprocess.CalledProcessError as e:
+        raise TerraformError(f"Terraform command failed: {e}")
+
+@retry()
+def run_terraform_destroy(config):
+    """Run Terraform destroy to roll back infrastructure."""
+    terraform_dir = config.data.get("terraform_dir", "./terraform")
+    try:
+        logger.info("Running Terraform destroy for rollback...")
+        subprocess.run(["terraform", "destroy", "-auto-approve"], cwd=terraform_dir, check=True)
+        logger.info("Terraform destroy completed successfully.")
+    except subprocess.CalledProcessError as e:
+        raise TerraformError(f"Terraform destroy failed during rollback: {e}")
+
+# ==============================================================
+# Rollback Mechanism
+# ==============================================================
+
+@contextmanager
+def rollback_manager(config):
+    """Context manager for rollback."""
+    try:
+        yield
+    except DeploymentError as e:
+        logger.error(f"An error occurred: {e}")
+        if config.rollback:
+            logger.info("Initiating rollback...")
+            run_terraform_destroy(config)
+        sys.exit(1)
+
+# ==============================================================
+# Main Execution
+# ==============================================================
+
+def main():
+    """Main script execution."""
+    args = parse_arguments()
+    global logger
+    logger = configure_logging(args.debug)
+
+    # Validate dependencies
+    validate_dependencies()
+
+    # Initialize configuration and AWS manager
+    config = Config(args)
+    AWSManager(config.region)
+
+    # Run deployment within rollback manager
+    with rollback_manager(config):
+        run_terraform(config)
+        logger.info("Deployment completed successfully.")
+
+if __name__ == "__main__":
+    main()

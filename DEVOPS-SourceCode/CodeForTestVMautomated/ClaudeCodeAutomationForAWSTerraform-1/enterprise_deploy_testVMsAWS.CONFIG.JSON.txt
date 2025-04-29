@@ -1,0 +1,10 @@
+{
+    "s3_bucket_name": "enterprise-auto-deploy",
+    "terraform_dir": "./terraform",
+    "ami_id": "ami-0c55b159cbfafe1f0",
+    "test_instance_type": "t2.micro",
+    "tags": {
+        "Environment": "Test",
+        "Project": "EnterpriseAutoDeploy"
+    }
+}

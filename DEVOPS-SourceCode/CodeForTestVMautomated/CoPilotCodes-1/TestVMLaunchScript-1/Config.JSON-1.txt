@@ -1,0 +1,11 @@
+{
+    "terraform_state_bucket": "enterprise-auto-state",
+    "terraform_dir": "./terraform",
+    "ami_id": "ami-0c55b159cbfafe1f0",
+    "test_instance_type": "t2.micro",
+    "sns_topic_arn": "arn:aws:sns:us-east-1:123456789012:EnterpriseDeployNotifications",
+    "tags": {
+        "Environment": "Test",
+        "Project": "EnterpriseAutoDeploy"
+    }
+}

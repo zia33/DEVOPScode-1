@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""
+AWS Enterprise Auto-Deployment Tool with S3 Logging & Expiration
+
+This script automates AWS infrastructure deployment using Terraform.
+It now logs deployment activities to an AWS S3 bucket, ensuring centralized monitoring,
+while setting up a lifecycle policy to delete logs older than 90 days.
+"""
+
+import os
+import sys
+import json
+import logging
+import argparse
+import subprocess
+import boto3
+from botocore.exceptions import ClientError, NoCredentialsError
+
+# ==============================================================
+# Logging Configuration - Local & S3 Storage
+# ==============================================================
+
+def configure_logging(debug=False, config=None):
+    """Set up logging for the script with S3 storage support."""
+    log_level = logging.DEBUG if debug else logging.INFO
+    log_filename = "enterprise_deploy.log"
+
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=[
+            logging.FileHandler(log_filename),
+            logging.StreamHandler(sys.stdout)
+        ]
+    )
+    logger = logging.getLogger(__name__)
+
+    # If S3 logging is enabled, upload logs to the configured bucket
+    if config and config.data.get("s3_logging_enabled", False):
+        upload_log_to_s3(config, log_filename)
+
+    return logger
+
+# ==============================================================
+# AWS Client Manager
+# ==============================================================
+
+class AWSManager:
+    """Manages AWS session and service clients."""
+    def __init__(self, region):
+        self.region = region
+        self.session = self._initialize_session()
+        self.clients = self._initialize_clients()
+
+    def _initialize_session(self):
+        """Initialize AWS session with error handling."""
+        try:
+            return boto3.Session(region_name=self.region)
+        except NoCredentialsError:
+            logger.error("AWS credentials not found. Ensure authentication via AWS CLI or environment variables.")
+            sys.exit(1)
+
+    def _initialize_clients(self):
+        """Initialize AWS service clients."""
+        try:
+            return {
+                "s3": self.session.client("s3"),
+                "ec2": self.session.client("ec2"),
+                "iam": self.session.client("iam"),
+                "sns": self.session.client("sns")
+            }
+        except ClientError as e:
+            logger.error(f"Failed to initialize AWS clients: {e}")
+            sys.exit(1)
+
+# ==============================================================
+# S3 Log Storage & Lifecycle Policy Setup
+# ==============================================================
+
+def upload_log_to_s3(config, log_filename):
+    """Upload logs to an S3 bucket."""
+    s3_client = AWSManager(config.region).clients["s3"]
+    bucket_name = config.data.get("s3_log_bucket")
+
+    if not bucket_name:
+        logger.warning("S3 bucket for logging is not configured. Logs will remain local.")
+        return
+
+    try:
+        s3_client.upload_file(log_filename, bucket_name, log_filename)
+        logger.info(f"Uploaded log file to S3 bucket: {bucket_name}/{log_filename}")
+    except ClientError as e:
+        logger.error(f"Failed to upload log file to S3: {e}")
+
+def setup_s3_lifecycle_policy(config):
+    """Set up an S3 lifecycle policy to delete logs after 90 days."""
+    s3_client = AWSManager(config.region).clients["s3"]
+    bucket_name = config.data.get("s3_log_bucket")
+
+    if not bucket_name:
+        logger.warning("S3 bucket for lifecycle policy is not set. Skipping lifecycle setup.")
+        return
+
+    lifecycle_policy = {
+        "Rules": [
+            {
+                "ID": "AutoDeleteLogsAfter90Days",
+                "Prefix": "",
+                "Status": "Enabled",
+                "Expiration": {"Days": 90}
+            }
+        ]
+    }
+
+    try:
+        s3_client.put_bucket_lifecycle_configuration(
+            Bucket=bucket_name,
+            LifecycleConfiguration=lifecycle_policy
+        )
+        logger.info(f"Set up lifecycle policy for S3 logs: Expire after 90 days.")
+    except ClientError as e:
+        logger.error(f"Failed to configure S3 lifecycle policy: {e}")
+
+# ==============================================================
+# Terraform Execution
+# ==============================================================
+
+def run_terraform(config):
+    """Run Terraform commands to deploy instances."""
+    terraform_dir = config.data.get("terraform_dir", "./terraform")
+    try:
+        logger.info("Initializing Terraform...")
+        subprocess.run(["terraform", "init"], cwd=terraform_dir, check=True)
+        subprocess.run(["terraform", "apply", "-auto-approve"], cwd=terraform_dir, check=True)
+        logger.info("Terraform deployment completed successfully.")
+        upload_log_to_s3(config, "enterprise_deploy.log")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Terraform command failed: {e}")
+        sys.exit(1)
+
+# ==============================================================
+# Main Execution
+# ==============================================================
+
+def main():
+    """Main script execution."""
+    args = parse_arguments()
+    global logger
+    config = Config(args)
+
+    logger = configure_logging(args.debug, config)
+
+    # Initialize AWS services & log storage policy setup
+    AWSManager(config.region)
+    setup_s3_lifecycle_policy(config)
+
+    try:
+        run_terraform(config)
+        logger.info("Deployment completed successfully.")
+    except Exception as e:
+        logger.error(f"Deployment failed: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

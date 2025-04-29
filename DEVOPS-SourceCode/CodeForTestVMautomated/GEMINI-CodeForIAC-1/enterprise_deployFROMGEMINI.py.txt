@@ -1,0 +1,858 @@
+import os
+import random
+import string
+import subprocess
+import time
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.resource import ResourceManagementClient, PolicyClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.storage.blob import BlobServiceClient, BlobClient
+from azure.mgmt.storage.models import (
+    StorageAccountCreateParameters,
+    Sku,
+    Kind,
+    DeleteRetentionPolicy
+)
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.network.models import (VirtualNetwork, Subnet, PublicIPAddress, NetworkInterface)
+from azure.mgmt.compute.models import (VirtualMachine, HardwareProfile, StorageProfile, ImageReference, OSProfile, NetworkProfile, NetworkInterfaceReference)
+from azure.communication.email import EmailClient
+from azure.core.exceptions import ResourceNotFoundError, ClientAuthenticationError
+
+# ==============================================================
+# Configuration Section
+# ==============================================================
+
+LOCATION = os.getenv("AZURE_LOCATION", "eastus")  # Default to eastus, but allow override
+RESOURCE_GROUP_NAME = "rg-enterprise-auto"
+STORAGE_ACCOUNT_NAME = "storage" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+CONTAINER_NAME = "tfstate"
+STATE_FILE_NAME = "terraform.tfstate"
+POLICY_NAME = "auto-delete-90days"
+POLICY_DISPLAY_NAME = "Auto-Delete Resources After 90 Days"
+POLICY_ASSIGNMENT_NAME = "auto-delete-assign"
+
+# VM Sizes
+COMMAND_VM_SIZE = os.getenv("COMMAND_VM_SIZE", "Standard_B1s")
+TEST_VM_SIZE = os.getenv("TEST_VM_SIZE", "Standard_B1s")
+VM_IMAGE_SKU = os.getenv("VM_IMAGE_SKU", "20_04-lts")  # Allow override
+
+# Admin credentials
+ADMIN_USERNAME = "azureadmin"
+ADMIN_PASSWORD = "ComplexP@ssw0rd123!" # CONSIDER: Using SSH keys is more secure for production environments
+
+# Email Settings
+COMM_SERVICE_CONNECTION_STRING = os.getenv('AZURE_COMM_SERVICE_CONNECTION')
+EMAIL_SENDER = "your-sender@example.com" # Replace with your sender email
+EMAIL_RECEIVER = "your-receiver@example.com" # Replace with your receiver email
+
+# Terraform Deployment Details
+DEPLOYMENT_DIR = "./deployment"
+TERRAFORM_FILE = "main.tf"
+
+# ==============================================================
+# Dynamic Auto-Tagging Setup
+# ==============================================================
+
+def generate_dynamic_tags():
+    """Generates dynamic tags based on environment variables (like GitHub Actions)."""
+    branch = os.getenv('GITHUB_REF', 'refs/heads/unknown').split('/')[-1]
+    actor = os.getenv('GITHUB_ACTOR', 'manual-run')
+
+    # Determine environment tag
+    env_tag = "Dev"
+    if branch == "main":
+        env_tag = "Production"
+    elif branch.startswith("release"):
+        env_tag = "Staging"
+
+    tags = {
+        "Environment": env_tag,
+        "TriggeredBy": actor,
+        "Branch": branch,
+        "AutoCreated": "True",
+        "Project": "EnterpriseAutoDeploy",
+        # Add creation time tag
+        "CreationDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    }
+    return tags
+
+DYNAMIC_TAGS = generate_dynamic_tags()
+
+# ==============================================================
+# Azure Authentication
+# ==============================================================
+
+try:
+    credential = DefaultAzureCredential()
+    subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+
+    resource_client = ResourceManagementClient(credential, subscription_id)
+    storage_client = StorageManagementClient(credential, subscription_id)
+    policy_client = PolicyClient(credential, subscription_id)
+    compute_client = ComputeManagementClient(credential, subscription_id)
+    network_client = NetworkManagementClient(credential, subscription_id)
+except ClientAuthenticationError as e:
+    print(f"Authentication Error: {e}")
+    print("Please ensure you are authenticated to Azure (e.g., via Azure CLI, environment variables, etc.)")
+    exit(1)
+except KeyError as e:
+    print(f"Missing environment variable: {e}")
+    print("Please ensure AZURE_SUBSCRIPTION_ID is set.")
+    exit(1)
+except Exception as e:
+    print(f"An unexpected error occurred during Azure authentication: {e}")
+    exit(1)
+
+
+# ==============================================================
+# Resource Group Creation
+# ==============================================================
+
+print(f"Creating or updating resource group: {RESOURCE_GROUP_NAME} in {LOCATION}")
+try:
+    # Check if RG exists and update tags, or create it
+    rg_check = resource_client.resource_groups.check_existence(RESOURCE_GROUP_NAME)
+    if rg_check:
+        print(f"Resource group '{RESOURCE_GROUP_NAME}' already exists. Updating tags.")
+        # Retrieve existing RG to update tags
+        existing_rg = resource_client.resource_groups.get(RESOURCE_GROUP_NAME)
+        updated_tags = existing_rg.tags if existing_rg.tags is not None else {}
+        updated_tags.update(DYNAMIC_TAGS)
+        resource_client.resource_groups.update(RESOURCE_GROUP_NAME, {"tags": updated_tags})
+    else:
+        print(f"Resource group '{RESOURCE_GROUP_NAME}' does not exist. Creating it.")
+        resource_client.resource_groups.create_or_update(
+            RESOURCE_GROUP_NAME,
+            {"location": LOCATION, "tags": DYNAMIC_TAGS}
+        )
+    print(f"Resource group '{RESOURCE_GROUP_NAME}' is ready.")
+
+except Exception as e:
+    print(f"Error creating or updating resource group: {e}")
+    exit(1)
+
+# ==============================================================
+# Storage Account + Blob Container Creation
+# ==============================================================
+
+print(f"Creating Storage Account: {STORAGE_ACCOUNT_NAME}")
+try:
+    # Check if storage account exists before trying to create
+    storage_account_exists = False
+    try:
+        storage_client.storage_accounts.get_properties(RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME)
+        storage_account_exists = True
+        print(f"Storage account '{STORAGE_ACCOUNT_NAME}' already exists.")
+    except ResourceNotFoundError:
+        pass # Storage account does not exist, proceed to create
+
+    if not storage_account_exists:
+        print(f"Creating storage account '{STORAGE_ACCOUNT_NAME}'...")
+        storage_async_operation = storage_client.storage_accounts.begin_create(
+            RESOURCE_GROUP_NAME,
+            STORAGE_ACCOUNT_NAME,
+            StorageAccountCreateParameters(
+                sku=Sku(name="Standard_LRS"),
+                kind=Kind.STORAGE_V2,
+                location=LOCATION,
+                tags=DYNAMIC_TAGS
+            )
+        )
+        storage_account = storage_async_operation.result()
+        print(f"Storage account '{STORAGE_ACCOUNT_NAME}' created.")
+    else:
+         # If it exists, just get the properties to proceed
+         storage_account = storage_client.storage_accounts.get_properties(RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME)
+
+
+except Exception as e:
+    print(f"Error creating storage account: {e}")
+    exit(1)
+
+# Get storage keys
+try:
+    print("Retrieving storage account keys...")
+    storage_keys = storage_client.storage_accounts.list_keys(RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME)
+    storage_key = storage_keys.keys[0].value
+    print("Storage account keys retrieved.")
+except Exception as e:
+    print(f"Error retrieving storage account keys: {e}")
+    exit(1)
+
+# Create Blob Container
+try:
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/",
+        credential=storage_key # Use key for creation if preferred, or credential if using DefaultAzureCredential
+    )
+    print(f"Creating Blob Container: {CONTAINER_NAME}")
+    container_client = blob_service_client.create_container(CONTAINER_NAME)
+    print(f"Blob Container '{CONTAINER_NAME}' created.")
+except Exception as e:
+    # Assuming the container might already exist is a common scenario for tfstate
+    print(f"Could not create container '{CONTAINER_NAME}'. It may already exist. Details: {str(e)}")
+
+# Create an empty tfstate file (if it doesn't exist)
+print("Ensuring empty terraform.tfstate file exists")
+try:
+    blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=STATE_FILE_NAME)
+    if not blob_client.exists():
+        print(f"Uploading empty {STATE_FILE_NAME} file.")
+        blob_client.upload_blob(b"{}", overwrite=False) # Only upload if it doesn't exist
+        print(f"Empty {STATE_FILE_NAME} uploaded.")
+    else:
+        print(f"{STATE_FILE_NAME} already exists.")
+except Exception as e:
+    print(f"Error ensuring {STATE_FILE_NAME} file exists: {e}")
+    # Continue as the file might be managed by Terraform next
+
+# ==============================================================
+# Apply Soft Delete and Retention
+# ==============================================================
+
+print("Setting soft delete retention on Storage Account Blob Service")
+try:
+    # Get current blob service properties
+    blob_service_properties = storage_client.blob_services.get_service_properties(
+        RESOURCE_GROUP_NAME,
+        STORAGE_ACCOUNT_NAME,
+        "default"
+    )
+
+    # Update or set delete retention policy
+    blob_service_properties.delete_retention_policy = DeleteRetentionPolicy(enabled=True, days=90)
+
+    storage_client.blob_services.set_service_properties(
+        RESOURCE_GROUP_NAME,
+        STORAGE_ACCOUNT_NAME,
+        "default",
+        blob_service_properties # Pass the updated properties object
+    )
+    print("Soft delete retention set to 90 days.")
+except Exception as e:
+    print(f"Error setting soft delete retention: {e}")
+    # Decide if this is a fatal error or just a warning
+    # exit(1) # Uncomment if this is critical
+
+# ==============================================================
+# Auto-Delete Policy Creation
+# ==============================================================
+
+print("Creating Auto-Delete After 90 Days Policy")
+
+# Azure Policy Definition for adding ExpirationDate and DeleteAfter tags
+# This policy modifies resources to add the tags if they don't exist.
+# A separate mechanism (like a Logic App or Azure Function) would be needed
+# to *act* on the DeleteAfter tag to actually delete resources.
+# The 'de139f84-1756-47ae-9be6-808fbbe84772' is the 'Contributor' role definition ID.
+# This role is needed by the policy assignment's managed identity to modify resource tags.
+# Ensure the system-assigned managed identity for the policy assignment has this role.
+policy_rule = {
+    "if": {
+        "allOf": [
+            {
+                "field": "tags['ExpirationDate']",
+                "exists": "false"
+            },
+            {
+                 "field": "tags['AutoCreated']",
+                 "equals": "True" # Only apply to auto-created resources
+            }
+        ]
+    },
+    "then": {
+        "effect": "modify",
+        "details": {
+            "roleDefinitionIds": [
+                 "/providers/microsoft.authorization/roleDefinitions/b24988ac-6180-42a0-ab88-20f7382dd24c" # Reader role might be sufficient just for tag modification
+                # Using Contributor role for simplicity in example, but scope down if possible
+                # "/providers/microsoft.authorization/roleDefinitions/de139f84-1756-47ae-9be6-808fbbe84772" # Contributor
+            ],
+            "operations": [
+                {
+                    "operation": "addOrReplace",
+                    "field": "tags.ExpirationDate",
+                    "value": "[utcNow('yyyy-MM-ddTHH:mm:ssZ')]"
+                },
+                {
+                    "operation": "addOrReplace",
+                    "field": "tags.DeleteAfter",
+                    "value": "[dateTimeAdd(utcNow(), 'P90D')]" # Add 90 days
+                }
+            ]
+        }
+    }
+}
+
+policy_definition_body = {
+    "properties": {
+        "policyRule": policy_rule,
+        "parameters": {},
+        "displayName": POLICY_DISPLAY_NAME,
+        "mode": "Indexed", # Applies to resources that have a 'tags' property
+        "description": "Adds ExpirationDate and DeleteAfter tags to auto-created resources if they don't exist."
+    }
+}
+
+try:
+    print(f"Creating or updating policy definition '{POLICY_NAME}'...")
+    # Check if policy definition exists
+    policy_definition_exists = False
+    try:
+        policy_client.policy_definitions.get(POLICY_NAME)
+        policy_definition_exists = True
+        print(f"Policy definition '{POLICY_NAME}' already exists. Updating it.")
+    except ResourceNotFoundError:
+        pass # Policy definition does not exist, proceed to create
+
+    policy = policy_client.policy_definitions.create_or_update(POLICY_NAME, policy_definition_body["properties"])
+    print(f"Policy definition '{POLICY_NAME}' is ready with ID: {policy.id}")
+
+    # Assign the policy
+    scope = f"/subscriptions/{subscription_id}/resourceGroups/{RESOURCE_GROUP_NAME}"
+    print(f"Assigning policy '{POLICY_NAME}' to scope '{scope}'")
+
+    policy_assignment_body = {
+        "properties": {
+            "policy_definition_id": policy.id,
+            "display_name": POLICY_DISPLAY_NAME,
+            "scope": scope,
+            "identity": { # Required for Modify effect policies
+                "type": "SystemAssigned"
+            },
+            "enforcement_mode": "Default" # Can be changed to "DoNotEnforce" for testing
+        },
+        "location": LOCATION # Location is required for SystemAssigned identity
+    }
+
+    # Check if policy assignment exists
+    policy_assignment_exists = False
+    try:
+        policy_client.policy_assignments.get(scope=scope, policy_assignment_name=POLICY_ASSIGNMENT_NAME)
+        policy_assignment_exists = True
+        print(f"Policy assignment '{POLICY_ASSIGNMENT_NAME}' already exists. Updating it.")
+    except ResourceNotFoundError:
+         pass # Policy assignment does not exist, proceed to create
+
+    policy_assignment = policy_client.policy_assignments.create(
+        scope=scope,
+        policy_assignment_name=POLICY_ASSIGNMENT_NAME,
+        parameters={}, # No parameters needed for this policy
+        policy_assignment=policy_assignment_body["properties"],
+        location=policy_assignment_body["location"] # Pass location separately for create method
+    )
+    print(f"Policy assignment '{POLICY_ASSIGNMENT_NAME}' is ready with ID: {policy_assignment.id}")
+
+    print("\nNOTE: For the 'modify' policy effect to work, the system-assigned managed identity of the policy assignment needs appropriate permissions (e.g., Contributor or a custom role allowing tag writes) on the assigned scope.")
+
+
+except Exception as e:
+    print(f"Error creating or assigning policy: {e}")
+    # Decide if this is a fatal error
+    # exit(1) # Uncomment if this is critical
+
+
+# ==============================================================
+# Generate Terraform Deployment Files
+# ==============================================================
+
+print("\nGenerating Terraform Deployment Files...")
+
+os.makedirs(DEPLOYMENT_DIR, exist_ok=True)
+
+terraform_main_content = f"""
+terraform {{
+  backend "azurerm" {{
+    resource_group_name  = "{RESOURCE_GROUP_NAME}"
+    storage_account_name = "{STORAGE_ACCOUNT_NAME}"
+    container_name       = "{CONTAINER_NAME}"
+    key                  = "{STATE_FILE_NAME}"
+  }}
+}}
+
+provider "azurerm" {{
+  features {{}}
+}}
+
+# Note: The resource group is managed by the Python script initially,
+# but including it here allows Terraform to track it and potentially
+# manage tags or other properties if needed later.
+# Ensure the tags are consistent between Python and Terraform if both manage them.
+#resource "azurerm_resource_group" "example" {{
+#  name          = "{RESOURCE_GROUP_NAME}" # Use the same RG name
+#  location      = "{LOCATION}"
+#  tags = {{
+#    Environment = "{DYNAMIC_TAGS.get('Environment', 'Unknown')}"
+#    TriggeredBy = "{DYNAMIC_TAGS.get('TriggeredBy', 'Unknown')}"
+#    Branch      = "{DYNAMIC_TAGS.get('Branch', 'Unknown')}"
+#    AutoCreated = "True"
+#    Project     = "EnterpriseAutoDeploy"
+#    CreationDate = "{DYNAMIC_TAGS.get('CreationDate', 'Unknown')}"
+#  }}
+#}}
+
+# Data source to reference the existing resource group managed by Python
+data "azurerm_resource_group" "example" {{
+  name = "{RESOURCE_GROUP_NAME}"
+}}
+
+resource "azurerm_virtual_network" "vnet" {{
+  name                = "vnet-example"
+  address_space       = ["10.0.0.0/16"]
+  location            = data.azurerm_resource_group.example.location
+  resource_group_name = data.azurerm_resource_group.example.name
+
+  tags = data.azurerm_resource_group.example.tags # Inherit tags from RG
+}}
+
+resource "azurerm_subnet" "subnet" {{
+  name                 = "subnet-example"
+  resource_group_name  = data.azurerm_resource_group.example.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
+
+  tags = data.azurerm_resource_group.example.tags # Inherit tags from RG
+}}
+
+resource "azurerm_public_ip" "pip" {{
+  name                = "pip-example"
+  location            = data.azurerm_resource_group.example.location
+  resource_group_name = data.azurerm_resource_group.example.name
+  allocation_method   = "Static"
+  sku                 = "Standard" # Recommended for production
+
+  tags = data.azurerm_resource_group.example.tags # Inherit tags from RG
+}}
+
+resource "azurerm_network_interface" "nic" {{
+  name                = "nic-example"
+  location            = data.azurerm_resource_group.example.location
+  resource_group_name = data.azurerm_resource_group.example.name
+
+  ip_configuration {{
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.pip.id
+  }}
+
+  tags = data.azurerm_resource_group.example.tags # Inherit tags from RG
+}}
+
+resource "azurerm_linux_virtual_machine" "vm" {{
+  name                = "vm-example"
+  resource_group_name = data.azurerm_resource_group.example.name
+  location            = data.azurerm_resource_group.example.location
+  size                = "{TEST_VM_SIZE}" # Using configurable VM size
+  admin_username      = "azureuser"
+  network_interface_ids = [
+    azurerm_network_interface.nic.id,
+  ]
+
+  admin_ssh_key {{
+    username   = "azureuser"
+    # Using file() requires the SSH key to exist where terraform is run.
+    # Consider using a Key Vault or generating a key pair within the script
+    # if running in an ephemeral environment without pre-configured keys.
+    public_key = file("~/.ssh/id_rsa.pub") # Make sure this file exists!
+  }}
+
+  os_disk {{
+    caching               = "ReadWrite"
+    storage_account_type  = "Standard_LRS" # Or Premium_LRS for better performance
+  }}
+
+  source_image_reference {{
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       = "{VM_IMAGE_SKU}"  # Using configurable image SKU
+    version   = "latest"
+  }}
+
+  # Enable boot diagnostics
+  boot_diagnostics {{
+    storage_account_uri = "{storage_account.primary_endpoints.blob}" # Requires the storage_account variable to be accessible if RG is not in TF
+    # Or if RG is a data source:
+    # storage_account_uri = "{storage_account.primary_blob_endpoint}" # Check the correct attribute name
+  }}
+
+  tags = data.azurerm_resource_group.example.tags # Inherit tags from RG
+
+  # Note: Admin password is not recommended for Linux VMs; use SSH keys.
+  # Removing admin_password for better security practice.
+  # admin_password = "{ADMIN_PASSWORD}"
+  disable_password_authentication = true # Require SSH key
+}}
+"""
+
+terraform_file_path = os.path.join(DEPLOYMENT_DIR, TERRAFORM_FILE)
+try:
+    with open(terraform_file_path, "w") as f:
+        f.write(terraform_main_content)
+    print(f"Terraform file '{terraform_file_path}' generated successfully.")
+except IOError as e:
+    print(f"Error writing Terraform file '{terraform_file_path}': {e}")
+    exit(1)
+
+
+# ==============================================================
+# Initialize and Apply Terraform
+# ==============================================================
+
+print("\nInitializing Terraform...")
+try:
+    subprocess.run(["terraform", "init", "-upgrade"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    print("Terraform initialization successful.")
+except subprocess.CalledProcessError as e:
+    print(f"Error initializing Terraform: {e.stderr}")
+    exit(1)
+
+print("Applying Terraform Plan...")
+try:
+    # Add -input=false for non-interactive apply in automation
+    subprocess.run(["terraform", "apply", "-auto-approve", "-input=false"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    print("Terraform apply successful.")
+except subprocess.CalledProcessError as e:
+    print(f"Error applying Terraform plan: {e.stderr}")
+    # Capture output to potentially email later
+    exit(1)
+except FileNotFoundError:
+     print("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+     exit(1)
+
+
+# ==============================================================
+# Networking Setup (Redundant section removed)
+# The Terraform script already created a VNet and Subnet.
+# Creating them again with the SDK is redundant and could cause conflicts.
+# Keeping helper functions below if needed for other SDK-based deployments.
+# ==============================================================
+
+# ==============================================================
+# Helper to Create Public IP
+# ==============================================================
+
+def create_public_ip(name):
+    """Creates or retrieves a Public IP address."""
+    print(f"Creating or getting Public IP: {name}")
+    try:
+        # Check if Public IP exists
+        try:
+            pip = network_client.public_ip_addresses.get(RESOURCE_GROUP_NAME, name)
+            print(f"Public IP '{name}' already exists.")
+            return pip
+        except ResourceNotFoundError:
+            pass # Public IP does not exist, proceed to create
+
+        pip_creation = network_client.public_ip_addresses.begin_create_or_update(
+            RESOURCE_GROUP_NAME,
+            name,
+            {
+                "location": LOCATION,
+                "public_ip_allocation_method": "Dynamic", # Or "Static"
+                "sku": {"name": "Basic"} # Or "Standard"
+            }
+        )
+        pip = pip_creation.result()
+        print(f"Public IP '{name}' created.")
+        return pip
+    except Exception as e:
+        print(f"Error creating public IP '{name}': {e}")
+        exit(1)
+
+# ==============================================================
+# Helper to Create NIC
+# ==============================================================
+
+def create_nic(name, subnet_id, public_ip_id=None):
+    """Creates or retrieves a Network Interface."""
+    print(f"Creating or getting Network Interface: {name}")
+    ip_config_properties = {
+        "name": "ipconfig1",
+        "subnet": {"id": subnet_id},
+        "private_ip_address_allocation": "Dynamic"
+    }
+    if public_ip_id:
+        ip_config_properties["public_ip_address"] = {"id": public_ip_id}
+
+    nic_params = {
+        "location": LOCATION,
+        "ip_configurations": [ip_config_properties],
+        "tags": DYNAMIC_TAGS # Apply dynamic tags to NICs
+    }
+
+    try:
+        # Check if NIC exists
+        try:
+            nic = network_client.network_interfaces.get(RESOURCE_GROUP_NAME, name)
+            print(f"Network Interface '{name}' already exists.")
+            return nic
+        except ResourceNotFoundError:
+            pass # NIC does not exist, proceed to create
+
+        nic_creation = network_client.network_interfaces.begin_create_or_update(
+            RESOURCE_GROUP_NAME,
+            name,
+            nic_params
+        )
+        nic = nic_creation.result()
+        print(f"Network Interface '{name}' created.")
+        return nic
+    except Exception as e:
+        print(f"Error creating NIC '{name}': {e}")
+        exit(1)
+
+# ==============================================================
+# Helper to Create VM
+# ==============================================================
+
+def create_vm(name, nic_id, size):
+    """Creates or retrieves a Virtual Machine."""
+    print(f"Creating or getting Virtual Machine: {name}")
+
+    vm_parameters = {
+        "location": LOCATION,
+        "tags": DYNAMIC_TAGS, # Apply dynamic tags to VMs
+        "hardware_profile": HardwareProfile(vm_size=size),
+        "storage_profile": StorageProfile(
+            image_reference=ImageReference(
+                publisher="Canonical",
+                offer="UbuntuServer",
+                sku=VM_IMAGE_SKU,  # Use the configurable SKU
+                version="latest"
+            ),
+            os_disk={
+                "caching": "ReadWrite",
+                "managed_disk": {"storage_account_type": "Standard_LRS"}, # Use managed disks
+                "name": f"{name}-osdisk"
+            }
+        ),
+        "os_profile": OSProfile(
+            computer_name=name,
+            admin_username=ADMIN_USERNAME,
+            admin_password=ADMIN_PASSWORD, # Using password for example, SSH keys are recommended
+            # Custom data can be used for cloud-init scripts
+            # custom_data="IyEvYmluL2Jhc2gKCi..."
+        ),
+        "network_profile": NetworkProfile(
+            network_interfaces=[NetworkInterfaceReference(id=nic_id, primary=True)]
+        )
+        # identity={"type": "SystemAssigned"} # Enable managed identity if needed
+    }
+
+    try:
+        # Check if VM exists
+        try:
+            vm = compute_client.virtual_machines.get(RESOURCE_GROUP_NAME, name)
+            print(f"Virtual Machine '{name}' already exists.")
+            return vm
+        except ResourceNotFoundError:
+            pass # VM does not exist, proceed to create
+
+        creation = compute_client.virtual_machines.begin_create_or_update(
+            RESOURCE_GROUP_NAME, name, vm_parameters
+        )
+        vm = creation.result()
+        print(f"Virtual Machine '{name}' created.")
+        return vm
+    except Exception as e:
+        print(f"Error creating VM '{name}': {e}")
+        exit(1)
+
+# ==============================================================
+# Obtain Network Resource IDs from Terraform Output
+# ==============================================================
+
+print("\nRetrieving network resource IDs from Terraform output...")
+
+try:
+    # Run terraform output to get the IDs of resources created by Terraform
+    tf_output_process = subprocess.run(
+        ["terraform", "output", "-json"],
+        cwd=DEPLOYMENT_DIR,
+        check=True,
+        capture_output=True,
+        text=True
+    )
+    tf_output = json.loads(tf_output_process.stdout)
+
+    # Assuming your Terraform output has the following structure:
+    # output "subnet_id" { value = azurerm_subnet.subnet.id }
+    # output "vnet_id" { value = azurerm_virtual_network.vnet.id }
+    subnet_id = tf_output.get("subnet_id", {}).get("value")
+    # vnet_id = tf_output.get("vnet_id", {}).get("value") # Not strictly needed for creating VMs
+
+    if not subnet_id:
+        raise ValueError("Terraform output 'subnet_id' not found or is empty.")
+
+    # You might need to retrieve the Subnet object using the ID for the helper function
+    # In this case, the helper function just needs the ID, so this is okay.
+    # If you needed the subnet object itself:
+    # subnet_resource = network_client.subnets.get(RESOURCE_GROUP_NAME, vnet_name, subnet_name)
+    # (Requires knowing VNet and Subnet names created by Terraform)
+    # Let's assume the subnet created by Terraform is used for SDK VMs.
+
+    print(f"Obtained Subnet ID from Terraform: {subnet_id}")
+
+except FileNotFoundError:
+     print("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+     exit(1)
+except subprocess.CalledProcessError as e:
+    print(f"Error running 'terraform output': {e.stderr}")
+    exit(1)
+except json.JSONDecodeError:
+    print("Error decoding Terraform output JSON.")
+    exit(1)
+except ValueError as e:
+    print(f"Error: {e}")
+    # You might need to infer or hardcode names if Terraform output isn't reliable
+    # For example, if Terraform creates "vnet-example" and "subnet-example"
+    # You could retrieve them by name here instead of using output.
+    print("Attempting to get network resources by known names instead...")
+    try:
+         vnet_resource = network_client.virtual_networks.get(RESOURCE_GROUP_NAME, "vnet-example")
+         subnet_resource = network_client.subnets.get(RESOURCE_GROUP_NAME, "vnet-example", "subnet-example")
+         subnet_id = subnet_resource.id
+         print(f"Obtained Subnet ID by name: {subnet_id}")
+    except Exception as e_fallback:
+         print(f"Failed to get network resources by name either: {e_fallback}")
+         print("Cannot proceed without a valid subnet ID.")
+         exit(1)
+
+
+# ==============================================================
+# Command VM Creation (using SDK)
+# ==============================================================
+
+print("\nDeploying Command VM (using SDK)...")
+try:
+    cmd_pub_ip = create_public_ip("cmd-vm-ip")
+    # Use the subnet ID obtained from Terraform
+    cmd_nic = create_nic("cmd-vm-nic", subnet_id, cmd_pub_ip.id)
+    command_vm = create_vm("cmd-vm", cmd_nic.id, COMMAND_VM_SIZE)
+    print(f"Command VM '{command_vm.name}' deployed with private IP: {cmd_nic.ip_configurations[0].private_ip_address} and public IP: {cmd_pub_ip.ip_address}")
+except Exception as e:
+    print(f"Failed to deploy Command VM: {e}")
+    exit(1)
+
+
+# ==============================================================
+# Test VMs Creation (using SDK)
+# ==============================================================
+
+print("\nDeploying Test VM 1 (using SDK)...")
+try:
+    test1_pub_ip = create_public_ip("test1-vm-ip")
+    # Use the subnet ID obtained from Terraform
+    test1_nic = create_nic("test1-vm-nic", subnet_id, test1_pub_ip.id)
+    test_vm1 = create_vm("test-vm1", test1_nic.id, TEST_VM_SIZE)
+    print(f"Test VM 1 '{test_vm1.name}' deployed with private IP: {test1_nic.ip_configurations[0].private_ip_address} and public IP: {test1_pub_ip.ip_address}")
+except Exception as e:
+    print(f"Failed to deploy Test VM 1: {e}")
+    # Decide if failure here is critical for the entire script
+    # exit(1)
+
+
+print("\nDeploying Test VM 2 (using SDK)...")
+try:
+    test2_pub_ip = create_public_ip("test2-vm-ip")
+    # Use the subnet ID obtained from Terraform
+    test2_nic = create_nic("test2-vm-nic", subnet_id, test2_pub_ip.id)
+    test_vm2 = create_vm("test-vm2", test2_nic.id, TEST_VM_SIZE)
+    print(f"Test VM 2 '{test_vm2.name}' deployed with private IP: {test2_nic.ip_configurations[0].private_ip_address} and public IP: {test2_pub_ip.ip_address}")
+except Exception as e:
+    print(f"Failed to deploy Test VM 2: {e}")
+    # Decide if failure here is critical
+    # exit(1)
+
+
+# ==============================================================
+# Send Email Notification (Optional)
+# ==============================================================
+
+if COMM_SERVICE_CONNECTION_STRING and EMAIL_SENDER and EMAIL_RECEIVER:
+    print("\nSending email notification...")
+    try:
+        email_client = EmailClient.from_connection_string(COMM_SERVICE_CONNECTION_STRING)
+
+        subject = f"Azure Automated Deployment Status - {DYNAMIC_TAGS.get('Environment', 'Unknown')}"
+        body = f"""
+        <html>
+        <body>
+            <h2>Automated Azure Resource Deployment Complete</h2>
+            <p>Deployment triggered by: {DYNAMIC_TAGS.get('TriggeredBy', 'N/A')}</p>
+            <p>Branch: {DYNAMIC_TAGS.get('Branch', 'N/A')}</p>
+            <p>Resource Group: {RESOURCE_GROUP_NAME}</p>
+            <p>Location: {LOCATION}</p>
+            <p>Creation Time: {DYNAMIC_TAGS.get('CreationDate', 'N/A')}</p>
+            <br>
+            <h3>Deployed Resources (Partial List):</h3>
+            <ul>
+                <li>Resource Group: {RESOURCE_GROUP_NAME}</li>
+                <li>Storage Account (for TFState): {STORAGE_ACCOUNT_NAME}</li>
+                <li>Terraform Deployed VM: vm-example (Size: {TEST_VM_SIZE}, Public IP: {tf_output.get('public_ip_address', {}).get('value', 'N/A')})</li>
+                <li>Command VM: cmd-vm (Size: {COMMAND_VM_SIZE}, Public IP: {cmd_pub_ip.ip_address if 'cmd_pub_ip' in locals() else 'N/A'})</li>
+                <li>Test VM 1: test-vm1 (Size: {TEST_VM_SIZE}, Public IP: {test1_pub_ip.ip_address if 'test1_pub_ip' in locals() else 'N/A'})</li>
+                <li>Test VM 2: test-vm2 (Size: {TEST_VM_SIZE}, Public IP: {test2_pub_ip.ip_address if 'test2_pub_ip' in locals() else 'N/A'})</li>
+                <li>Auto-Delete Policy Assigned: {POLICY_DISPLAY_NAME}</li>
+            </ul>
+             <br>
+            <p>Resources tagged with "AutoCreated": "True" are subject to the auto-delete policy based on the "DeleteAfter" tag.</p>
+            <p>Ensure the Policy Assignment's managed identity has appropriate permissions to modify tags.</p>
+            <br>
+            <p>Thank you!</p>
+        </body>
+        </html>
+        """
+
+        message = {
+            "senderAddress": EMAIL_SENDER,
+            "recipients": { "to": [{ "address": EMAIL_RECEIVER }] },
+            "content": {
+                "subject": subject,
+                "html": body
+            }
+        }
+
+        poller = email_client.begin_send(message)
+        # We don't necessarily need to wait for the email to be sent
+        # poller.wait()
+        print("Email sending initiated.")
+
+    except Exception as e:
+        print(f"Error sending email notification: {e}")
+        print("Please ensure Azure Communication Service connection string, sender, and receiver are configured correctly.")
+else:
+    print("\nSkipping email notification: Communication service details not provided.")
+    print("Set AZURE_COMM_SERVICE_CONNECTION, EMAIL_SENDER, and EMAIL_RECEIVER environment variables to enable.")
+
+
+# ==============================================================
+# Completion
+# ==============================================================
+
+print("\nAzure resource deployment script completed.")
+print(f"Resource Group: {RESOURCE_GROUP_NAME}")
+print(f"Storage Account (TFState): {STORAGE_ACCOUNT_NAME}")
+print(f"Terraform config in: {DEPLOYMENT_DIR}")
+
+# Optional: Add logic here to run commands on the Command VM,
+# or perform tests against the Test VMs.
+# This would typically involve SSHing into the VMs, which requires
+# managing SSH keys securely (e.g., using Azure Key Vault).
+
+# Example (Pseudo-code):
+# try:
+#     print("\nAttempting to SSH into Command VM...")
+#     # Need public IP of Command VM and SSH key/password
+#     command_vm_public_ip = cmd_pub_ip.ip_address if 'cmd_pub_ip' in locals() else None
+#     if command_vm_public_ip:
+#         # Example: Run a simple command (requires handling SSH connection details)
+#         # subprocess.run(["ssh", f"{ADMIN_USERNAME}@{command_vm_public_ip}", "hostname"], check=True)
+#         print(f"Connect to Command VM using SSH: ssh {ADMIN_USERNAME}@{command_vm_public_ip}")
+#     else:
+#         print("Command VM public IP not found.")
+# except Exception as e:
+#     print(f"Error connecting to Command VM: {e}")

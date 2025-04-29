@@ -1,0 +1,712 @@
+import os
+import random
+import string
+import subprocess
+import time
+import json
+import logging
+from datetime import datetime, timedelta
+
+# GCP Libraries
+import google.auth
+from google.cloud import storage
+from google.cloud import resourcemanager_v3 # For interacting with projects/folders (optional, depends on needs)
+from google.cloud import compute_v1 # For interacting with compute resources (optional, if not fully TF)
+from google.cloud import logging as cloud_logging # For sending logs to Cloud Logging
+
+# Email (using standard SMTP for flexibility)
+import smtplib
+from email.mime.text import MIMEText
+
+# ==============================================================
+# Configuration Section
+# ==============================================================
+
+# GCP Configuration
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID") # MANDATORY: Your GCP Project ID
+GCP_REGION = os.getenv("GCP_REGION", "us-central1") # Default region
+GCP_ZONE = os.getenv("GCP_ZONE", f"{GCP_REGION}-a") # Default zone within region
+
+# State Storage Configuration
+# Use a unique bucket name (globally)
+STATE_BUCKET_NAME = f"{GCP_PROJECT_ID}-tfstate-{random.choices(string.ascii_lowercase + string.digits, k=8)}".lower()
+STATE_FILE_NAME = "terraform.tfstate"
+
+# Deployment Details
+DEPLOYMENT_NAME = "enterprise-auto-deploy"
+# Resource Naming Prefix - helps identify resources created by this script
+RESOURCE_PREFIX = f"{DEPLOYMENT_NAME.replace('-', '')}"
+# Terraform Deployment Details
+DEPLOYMENT_DIR = "./gcp_deployment"
+TERRAFORM_FILE = "main.tf"
+
+# VM Sizes & Images
+# Example GCP machine types: e2-small, n2-standard-2, c2-standard-4
+COMMAND_VM_MACHINE_TYPE = os.getenv("COMMAND_VM_MACHINE_TYPE", "e2-small")
+TEST_VM_MACHINE_TYPE = os.getenv("TEST_VM_MACHINE_TYPE", "e2-micro") # Smaller for test
+# Example Image Families: ubuntu-2004-lts, debian-10, cos-cloud
+VM_IMAGE_FAMILY = os.getenv("VM_IMAGE_FAMILY", "ubuntu-2004-lts")
+VM_IMAGE_PROJECT = os.getenv("VM_IMAGE_PROJECT", "ubuntu-os-cloud") # Project where the image is hosted
+
+# Admin Username (for SSH)
+ADMIN_USERNAME = "gcpadmin" # Standard username for SSH
+
+# Email Settings (Using standard SMTP)
+# Requires an SMTP server setup (e.g., SendGrid, Gmail Relay)
+SMTP_SERVER = os.getenv("SMTP_SERVER")
+SMTP_PORT = os.getenv("SMTP_PORT", 587) # Standard TLS port
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER") # Can be a comma-separated list
+
+# ==============================================================
+# Logging Configuration
+# ==============================================================
+
+# Configure standard Python logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S')
+
+# Optional: Configure Cloud Logging handler
+CLOUD_LOGGING_CLIENT = None
+if GCP_PROJECT_ID:
+    try:
+        # Initialize Cloud Logging client - requires appropriate IAM permissions
+        CLOUD_LOGGING_CLIENT = cloud_logging.Client(project=GCP_PROJECT_ID)
+        cloud_handler = CloudLoggingHandler(CLOUD_LOGGING_CLIENT)
+        logging.getLogger().addHandler(cloud_handler)
+        logging.info("Configured Cloud Logging handler.")
+    except Exception as e:
+        logging.warning(f"Could not configure Cloud Logging: {e}. Logging only to console.")
+        CLOUD_LOGGING_CLIENT = None # Ensure it's None if setup fails
+
+class CloudLoggingHandler(logging.Handler):
+    """A logging handler that sends logs to Google Cloud Logging."""
+    def __init__(self, client, name="enterprise-deploy-script"):
+        super().__init__()
+        self.client = client
+        self.logger_name = client.logger(name)
+
+    def emit(self, record):
+        try:
+            # Convert standard logging levels to Cloud Logging levels
+            # See: https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#LogSeverity
+            severity_map = {
+                logging.DEBUG: 'DEBUG',
+                logging.INFO: 'INFO',
+                logging.WARNING: 'WARNING',
+                logging.ERROR: 'ERROR',
+                logging.CRITICAL: 'CRITICAL'
+            }
+            severity = severity_map.get(record.levelno, 'DEFAULT')
+
+            # Prepare payload
+            payload = {
+                "message": self.format(record), # Formatted message string
+                "severity": severity,
+                "python_logger": record.name,
+                "python_level": record.levelname,
+                "process": record.process,
+                "thread": record.thread,
+                "filename": record.filename,
+                "lineno": record.lineno,
+                "funcName": record.funcName
+            }
+
+            # Log structured entry
+            self.logger_name.log_struct(payload, severity=severity)
+
+        except Exception as e:
+            # Log to stderr if sending to Cloud Logging fails
+            self.handleError(record)
+
+
+# ==============================================================
+# Dynamic Resource Labels (GCP equivalent of tags)
+# ==============================================================
+
+def generate_resource_labels():
+    """Generates dynamic labels based on environment variables."""
+    # GCP labels must start with a lowercase letter and contain only
+    # lowercase letters, numbers, or dashes. Max length 63 characters.
+    # Keys cannot be empty. Values can be empty.
+
+    branch_raw = os.getenv('GITHUB_REF', 'unknown').split('/')[-1].lower()
+    # Clean branch name for labels: replace non-alphanumeric/dash with dash
+    branch = ''.join(c if c.isalnum() or c == '-' else '-' for c in branch_raw).strip('-')
+    branch = branch[:63] # Truncate to max length
+
+    actor_raw = os.getenv('GITHUB_ACTOR', 'manual-run').lower()
+    actor = ''.join(c if c.isalnum() or c == '-' else '-' for c in actor_raw).strip('-')
+    actor = actor[:63] # Truncate
+
+    env_label = "dev"
+    if branch == "main":
+        env_label = "prod"
+    elif branch.startswith("release"):
+        env_label = "staging"
+
+    labels = {
+        "environment": env_label,
+        "triggered-by": actor,
+        "branch": branch,
+        "auto-created": "true",
+        "project-name": DEPLOYMENT_NAME.lower(), # Use deployment name as project identifier
+        "created-at": datetime.now().strftime("%Y-%m-%dT%H-%M-%SZ") # Using dashes instead of colons for labels
+    }
+
+    # Add a future expiry label (GCP doesn't auto-act on this, needs separate automation)
+    expiry_date = datetime.now() + timedelta(days=90)
+    labels["delete-after"] = expiry_date.strftime("%Y-%m-%d") # Simpler format for date
+
+    return labels
+
+DYNAMIC_LABELS = generate_resource_labels()
+logging.info(f"Generated Dynamic Labels: {DYNAMIC_LABELS}")
+
+# ==============================================================
+# GCP Authentication
+# ==============================================================
+
+credentials = None
+try:
+    # Use Application Default Credentials (ADC)
+    # This will automatically look for credentials in the environment
+    # (e.g., GOOGLE_APPLICATION_CREDENTIALS env var, GKE/GCE metadata, gcloud CLI config)
+    credentials, project = google.auth.default()
+
+    if not GCP_PROJECT_ID:
+         if project:
+             GCP_PROJECT_ID = project
+             logging.info(f"Using project ID from credentials: {GCP_PROJECT_ID}")
+         else:
+             raise ValueError("GCP_PROJECT_ID environment variable is not set, and could not be determined from credentials.")
+
+    logging.info(f"Authenticated successfully for project: {GCP_PROJECT_ID}")
+
+    # Optional: Verify project exists and is accessible using Resource Manager API
+    # Requires 'resourcemanager.projects.get' permission
+    # try:
+    #      resource_manager = resourcemanager_v3.ProjectsClient(credentials=credentials)
+    #      project_name = f"projects/{GCP_PROJECT_ID}"
+    #      project_resource = resource_manager.get_project(name=project_name)
+    #      logging.info(f"Verified access to project: {project_resource.display_name} ({GCP_PROJECT_ID})")
+    # except Exception as e:
+    #     logging.error(f"Failed to verify access to project {GCP_PROJECT_ID}: {e}")
+    #     logging.error("Please ensure the project ID is correct and the service account has 'roles/resourcemanager.projectIamAdmin' or 'roles/viewer'.")
+    #     exit(1)
+
+
+except google.auth.exceptions.DefaultCredentialsError as e:
+    logging.error(f"GCP Authentication Error: {e}")
+    logging.error("Could not determine default credentials. Please ensure GOOGLE_APPLICATION_CREDENTIALS, gcloud config, or environment metadata is set up correctly.")
+    exit(1)
+except ValueError as e:
+    logging.error(f"Configuration Error: {e}")
+    exit(1)
+except Exception as e:
+    logging.error(f"An unexpected error occurred during GCP authentication: {e}")
+    exit(1)
+
+
+# Initialize GCP Clients (optional - primarily using Terraform)
+# storage_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
+# compute_client = compute_v1.InstancesClient(credentials=credentials)
+# networks_client = compute_v1.NetworksClient(credentials=credentials)
+# subnets_client = compute_v1.SubnetworksClient(credentials=credentials)
+# firewall_client = compute_v1.FirewallsClient(credentials=credentials)
+
+
+# ==============================================================
+# Cloud Storage Bucket Creation (for Terraform State)
+# ==============================================================
+
+logging.info(f"\nEnsuring Cloud Storage Bucket exists for Terraform state: gs://{STATE_BUCKET_NAME}")
+
+storage_client = storage.Client(credentials=credentials, project=GCP_PROJECT_ID)
+
+try:
+    bucket = storage_client.lookup_bucket(STATE_BUCKET_NAME)
+    if bucket:
+        logging.info(f"Bucket '{STATE_BUCKET_NAME}' already exists.")
+    else:
+        logging.info(f"Bucket '{STATE_BUCKET_NAME}' does not exist. Creating...")
+        # Bucket names are globally unique
+        bucket = storage_client.create_bucket(STATE_BUCKET_NAME, location=GCP_REGION) # Buckets are regional or multi-regional
+        logging.info(f"Bucket '{STATE_BUCKET_NAME}' created in region {GCP_REGION}.")
+
+    # Ensure Versioning is enabled for state protection
+    if not bucket.versioning_enabled:
+        logging.info("Enabling Versioning on the bucket.")
+        bucket.versioning_enabled = True
+        bucket.patch()
+        logging.info("Versioning enabled.")
+    else:
+         logging.info("Versioning is already enabled on the bucket.")
+
+    # Optional: Set Retention Policy (soft delete equivalent)
+    # This requires the 'storage.buckets.update' permission
+    # from datetime import timedelta
+    # retention_period = timedelta(days=90)
+    # if not bucket.retention_policy or bucket.retention_policy.retention_period is None or bucket.retention_policy.retention_period < retention_period.total_seconds():
+    #     logging.info(f"Setting/Updating Retention Policy to {retention_period.days} days.")
+    #     bucket.retention_policy_mode = 'unlocked' # Or 'locked' if permanent
+    #     bucket.retention_period = retention_period.total_seconds()
+    #     bucket.patch()
+    #     logging.info("Retention Policy set.")
+    # else:
+    #     logging.info("Retention policy is already set to a sufficient period.")
+
+except Exception as e:
+    logging.error(f"Error creating or configuring Cloud Storage Bucket '{STATE_BUCKET_NAME}': {e}")
+    logging.error("Please ensure the service account has 'roles/storage.admin' or equivalent permissions.")
+    exit(1)
+
+
+# Create an empty tfstate file if it doesn't exist
+logging.info(f"Ensuring empty Terraform state file exists: {STATE_FILE_NAME}")
+try:
+    bucket = storage_client.get_bucket(STATE_BUCKET_NAME)
+    blob = bucket.blob(STATE_FILE_NAME)
+    if not blob.exists():
+        logging.info(f"'{STATE_FILE_NAME}' does not exist. Uploading empty content.")
+        blob.upload_from_string("{}", content_type="application/json")
+        logging.info(f"Empty '{STATE_FILE_NAME}' uploaded.")
+    else:
+        logging.info(f"'{STATE_FILE_NAME}' already exists.")
+except Exception as e:
+    logging.warning(f"Error ensuring empty state file exists: {e}. Terraform init might create it.")
+    # This might not be a fatal error, Terraform init can often handle missing state
+
+# ==============================================================
+# Generate Terraform Deployment Files
+# ==============================================================
+
+logging.info("\nGenerating Terraform Deployment Files...")
+
+os.makedirs(DEPLOYMENT_DIR, exist_ok=True)
+
+# Convert dynamic labels dictionary to Terraform map format string
+labels_tf_format = "{\n" + "\n".join([f'    "{key}" = "{value}"' for key, value in DYNAMIC_LABELS.items()]) + "\n  }"
+
+terraform_main_content = f"""
+terraform {{
+  required_providers {{
+    google = {{
+      source  = "hashicorp/google"
+      version = "~> 5.0" # Use an appropriate version range
+    }}
+  }}
+  backend "gcs" {{
+    bucket = "{STATE_BUCKET_NAME}"
+    prefix = "{DEPLOYMENT_NAME}/state" # Optional: Use a prefix within the bucket
+  }}
+}}
+
+provider "google" {{
+  project = "{GCP_PROJECT_ID}"
+  region  = "{GCP_REGION}"
+  # credentials = file("/path/to/service/account/key.json") # Use ADC instead if possible
+}}
+
+# Use data source to reference the project itself
+data "google_project" "current" {{}}
+
+# --------------------------------------------------------------
+# Network Resources (VPC, Subnet, Firewall Rules)
+# --------------------------------------------------------------
+
+resource "google_compute_network" "vpc_network" {{
+  name = "{RESOURCE_PREFIX}-vpc"
+  # auto_create_subnetworks = true # Set to false for more control
+  auto_create_subnetworks = false
+
+  labels = {labels_tf_format}
+}}
+
+resource "google_compute_subnetwork" "vpc_subnet" {{
+  name          = "{RESOURCE_PREFIX}-subnet"
+  ip_cidr_range = "10.0.1.0/24"
+  region        = google_compute_network.vpc_network.region # Inherit region from network
+  network       = google_compute_network.vpc_network.id
+
+  labels = {labels_tf_format}
+}}
+
+# Firewall rule to allow SSH from anywhere (adjust source_ranges for security)
+resource "google_compute_firewall" "allow_ssh" {{
+  name    = "{RESOURCE_PREFIX}-allow-ssh"
+  network = google_compute_network.vpc_network.name
+  priority = 65500 # Lower priority = higher precedence
+
+  allow {{
+    protocol = "tcp"
+    ports    = ["22"]
+  }}
+
+  # Apply this rule to instances with the 'ssh-access' network tag
+  target_tags = ["ssh-access"]
+
+  # WARNING: 0.0.0.0/0 allows access from the entire internet.
+  # Restrict this in production environments!
+  # Example: source_ranges = ["your-office-ip/32", "bastion-subnet-cidr"]
+  source_ranges = ["0.0.0.0/0"]
+
+  labels = {labels_tf_format}
+}}
+
+# Firewall rule to allow ICMP (ping) for testing
+resource "google_compute_firewall" "allow_icmp" {{
+  name    = "{RESOURCE_PREFIX}-allow-icmp"
+  network = google_compute_network.vpc_network.name
+  priority = 65500 # Lower priority = higher precedence
+
+  allow {{
+    protocol = "icmp"
+  }}
+
+  target_tags = ["icmp-access"] # Apply to instances with this tag
+
+  source_ranges = ["0.0.0.0/0"] # Adjust for security
+
+  labels = {labels_tf_format}
+}}
+
+
+# --------------------------------------------------------------
+# Compute Resources (VM Instances)
+# --------------------------------------------------------------
+
+# Helper to lookup the latest image
+data "google_compute_image" "vm_image" {{
+  family  = "{VM_IMAGE_FAMILY}"
+  project = "{VM_IMAGE_PROJECT}"
+}}
+
+# Command VM
+resource "google_compute_instance" "command_vm" {{
+  name         = "{RESOURCE_PREFIX}-cmd-vm"
+  machine_type = "{COMMAND_VM_MACHINE_TYPE}"
+  zone         = "{GCP_ZONE}" # Instances are zonal
+
+  tags = ["ssh-access", "icmp-access", "{RESOURCE_PREFIX}-command-vm"] # Apply network tags for firewall rules
+
+  boot_disk {{
+    initialize_params {{
+      image = data.google_compute_image.vm_image.self_link
+      size  = 20 # GB
+      type  = "pd-standard" # Or "pd-ssd" for better performance
+    }}
+  }}
+
+  network_interface {{
+    subnetwork = google_compute_subnetwork.vpc_subnet.id
+    # Add an access_config block to assign an external IP
+    access_config {{
+      # Include this block to assign a dynamic public IP
+    }}
+    # If you need a static external IP:
+    # access_config {{
+    #   nat_ip = google_compute_address.command_vm_static_ip.self_link
+    # }}
+  }}
+
+  # Add SSH key for access (replace with your public key or use OS Login)
+  metadata = {{
+    "ssh-keys" = "{ADMIN_USERNAME}: $(cat ~/.ssh/id_rsa.pub)" # Reads public key from where TF is run
+    # Alternatively, hardcode the public key string:
+    # "ssh-keys" = "{ADMIN_USERNAME}: ssh-rsa AAAA... your-public-key-string"
+  }}
+
+  # Recommended: Enable OS Login for IAM-based SSH key management
+  # metadata = {{
+  #   "enable-oslogin" = "TRUE"
+  # }}
+  # Requires enabling the OS Login API and granting appropriate IAM roles to users.
+
+  labels = {labels_tf_format}
+}}
+
+# Optional: Static external IP for Command VM if needed
+# resource "google_compute_address" "command_vm_static_ip" {{
+#   name   = "{RESOURCE_PREFIX}-cmd-vm-static-ip"
+#   region = google_compute_subnetwork.vpc_subnet.region # Must match subnet region
+# }}
+
+
+# Test VM 1
+resource "google_compute_instance" "test_vm1" {{
+  name         = "{RESOURCE_PREFIX}-test-vm1"
+  machine_type = "{TEST_VM_MACHINE_TYPE}"
+  zone         = "{GCP_ZONE}"
+
+  tags = ["ssh-access", "icmp-access", "{RESOURCE_PREFIX}-test-vm"] # Apply network tags
+
+  boot_disk {{
+    initialize_params {{
+      image = data.google_compute_image.vm_image.self_link
+      size  = 10 # GB
+      type  = "pd-standard"
+    }}
+  }}
+
+  network_interface {{
+    subnetwork = google_compute_subnetwork.vpc_subnet.id
+     access_config {{}} # Assign a dynamic public IP
+  }}
+
+  metadata = {{
+    "ssh-keys" = "{ADMIN_USERNAME}: $(cat ~/.ssh/id_rsa.pub)"
+  }}
+
+  labels = {labels_tf_format}
+}}
+
+# Test VM 2
+resource "google_compute_instance" "test_vm2" {{
+  name         = "{RESOURCE_PREFIX}-test-vm2"
+  machine_type = "{TEST_VM_MACHINE_TYPE}"
+  zone         = "{GCP_ZONE}"
+
+  tags = ["ssh-access", "icmp-access", "{RESOURCE_PREFIX}-test-vm"] # Apply network tags
+
+  boot_disk {{
+    initialize_params {{
+      image = data.google_compute_image.vm_image.self_link
+      size  = 10 # GB
+      type  = "pd-standard"
+    }}
+  }}
+
+  network_interface {{
+    subnetwork = google_compute_subnetwork.vpc_subnet.id
+    access_config {{}} # Assign a dynamic public IP
+  }}
+
+  metadata = {{
+    "ssh-keys" = "{ADMIN_USERNAME}: $(cat ~/.ssh/id_rsa.pub)"
+  }}
+
+  labels = {labels_tf_format}
+}}
+
+
+# --------------------------------------------------------------
+# Terraform Outputs
+# --------------------------------------------------------------
+
+output "project_id" {{
+  description = "The GCP Project ID"
+  value       = data.google_project.current.project_id
+}}
+
+output "vpc_network_name" {{
+  description = "Name of the VPC network"
+  value       = google_compute_network.vpc_network.name
+}}
+
+output "vpc_subnet_name" {{
+  description = "Name of the subnet"
+  value       = google_compute_subnetwork.vpc_subnet.name
+}}
+
+output "command_vm_name" {{
+  description = "Name of the Command VM"
+  value       = google_compute_instance.command_vm.name
+}}
+
+output "command_vm_external_ip" {{
+  description = "External IP address of the Command VM"
+  value       = google_compute_instance.command_vm.network_interface[0].access_config[0].nat_ip
+}}
+
+output "test_vm1_name" {{
+  description = "Name of Test VM 1"
+  value       = google_compute_instance.test_vm1.name
+}}
+
+output "test_vm1_external_ip" {{
+  description = "External IP address of Test VM 1"
+  value       = google_compute_instance.test_vm1.network_interface[0].access_config[0].nat_ip
+}}
+
+output "test_vm2_name" {{
+  description = "Name of Test VM 2"
+  value       = google_compute_instance.test_vm2.name
+}}
+
+output "test_vm2_external_ip" {{
+  description = "External IP address of Test VM 2"
+  value       = google_compute_instance.test_vm2.network_interface[0].access_config[0].nat_ip
+}}
+"""
+
+terraform_file_path = os.path.join(DEPLOYMENT_DIR, TERRAFORM_FILE)
+try:
+    with open(terraform_file_path, "w") as f:
+        f.write(terraform_main_content)
+    logging.info(f"Terraform file '{terraform_file_path}' generated successfully.")
+except IOError as e:
+    logging.error(f"Error writing Terraform file '{terraform_file_path}': {e}")
+    exit(1)
+
+# ==============================================================
+# Initialize and Apply Terraform
+# ==============================================================
+
+logging.info("\nInitializing Terraform...")
+try:
+    # Use GOOGLE_CLOUD_PROJECT env var for Terraform if needed
+    # os.environ['GOOGLE_CLOUD_PROJECT'] = GCP_PROJECT_ID # Ensure this is set if not using provider block
+    # os.environ['GOOGLE_CLOUD_REGION'] = GCP_REGION
+
+    init_process = subprocess.run(["terraform", "init", "-upgrade"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    logging.info("Terraform initialization successful.")
+    logging.debug("Terraform Init Output:\n" + init_process.stdout)
+except FileNotFoundError:
+    logging.error("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+    exit(1)
+except subprocess.CalledProcessError as e:
+    logging.error(f"Error initializing Terraform: {e.stderr}")
+    exit(1)
+except Exception as e:
+    logging.error(f"An unexpected error occurred during Terraform initialization: {e}")
+    exit(1)
+
+
+logging.info("Applying Terraform Plan...")
+try:
+    # Add -input=false for non-interactive apply in automation
+    apply_process = subprocess.run(["terraform", "apply", "-auto-approve", "-input=false"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    logging.info("Terraform apply successful.")
+    logging.debug("Terraform Apply Output:\n" + apply_process.stdout)
+
+    # Get Terraform Outputs
+    logging.info("Retrieving Terraform outputs...")
+    output_process = subprocess.run(
+        ["terraform", "output", "-json"],
+        cwd=DEPLOYMENT_DIR,
+        check=True,
+        capture_output=True,
+        text=True
+    )
+    tf_outputs = json.loads(output_process.stdout)
+    logging.info("Terraform outputs retrieved.")
+    logging.debug("Terraform Outputs:\n" + json.dumps(tf_outputs, indent=2))
+
+
+except FileNotFoundError:
+     logging.error("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+     tf_outputs = {} # Set to empty dict if terraform isn't found
+     exit(1)
+except subprocess.CalledProcessError as e:
+    logging.error(f"Error applying Terraform plan: {e.stderr}")
+    tf_outputs = {} # Set to empty dict on failure
+    exit(1)
+except json.JSONDecodeError:
+    logging.error("Error decoding Terraform output JSON.")
+    tf_outputs = {} # Set to empty dict on failure
+    exit(1)
+except Exception as e:
+    logging.error(f"An unexpected error occurred during Terraform apply or output: {e}")
+    tf_outputs = {} # Set to empty dict on failure
+    exit(1)
+
+# ==============================================================
+# Send Email Notification (Optional - using SMTP)
+# ==============================================================
+
+if SMTP_SERVER and SMTP_USER and SMTP_PASSWORD and EMAIL_SENDER and EMAIL_RECEIVER:
+    logging.info("\nAttempting to send email notification...")
+    try:
+        # Basic email content
+        subject = f"GCP Automated Deployment Status - {DYNAMIC_LABELS.get('environment', 'Unknown')}"
+        body = f"""
+        <html>
+        <body>
+            <h2>Automated GCP Resource Deployment Complete</h2>
+            <p>Deployment triggered by: {DYNAMIC_LABELS.get('triggered-by', 'N/A')}</p>
+            <p>Branch: {DYNAMIC_LABELS.get('branch', 'N/A')}</p>
+            <p>GCP Project: {tf_outputs.get('project_id', {}).get('value', 'N/A')}</p>
+            <p>Region: {GCP_REGION}</p>
+            <p>Zone: {GCP_ZONE}</p>
+            <p>Creation Time: {DYNAMIC_LABELS.get('created-at', 'N/A')}</p>
+            <br>
+            <h3>Deployed Resources (via Terraform):</h3>
+            <ul>
+                <li>VPC Network: {tf_outputs.get('vpc_network_name', {}).get('value', 'N/A')}</li>
+                <li>Subnet: {tf_outputs.get('vpc_subnet_name', {}).get('value', 'N/A')}</li>
+                <li>Command VM ({tf_outputs.get('command_vm_name', {}).get('value', 'N/A')}): Machine Type: {COMMAND_VM_MACHINE_TYPE}, External IP: {tf_outputs.get('command_vm_external_ip', {}).get('value', 'N/A')}</li>
+                <li>Test VM 1 ({tf_outputs.get('test_vm1_name', {}).get('value', 'N/A')}): Machine Type: {TEST_VM_MACHINE_TYPE}, External IP: {tf_outputs.get('test_vm1_external_ip', {}).get('value', 'N/A')}</li>
+                <li>Test VM 2 ({tf_outputs.get('test_vm2_name', {}).get('value', 'N/A')}): Machine Type: {TEST_VM_MACHINE_TYPE}, External IP: {tf_outputs.get('test_vm2_external_ip', {}).get('value', 'N/A')}</li>
+                <li>Terraform State Bucket: {STATE_BUCKET_NAME}</li>
+            </ul>
+             <br>
+            <p>Resources are labeled with: {DYNAMIC_LABELS}</p>
+            <p>Resources labeled with "delete-after" = "{DYNAMIC_LABELS.get('delete-after', 'N/A')}" are candidates for automated cleanup by a separate process.</p>
+            <br>
+            <p>Access VMs using SSH with user '{ADMIN_USERNAME}' and the SSH key configured in the deployment.</p>
+            <p>Ensure necessary firewall rules and <a href="https://cloud.google.com/compute/docs/os-login">OS Login</a> (if enabled) are configured for access.</p>
+            <br>
+            <p>Thank you!</p>
+        </body>
+        </html>
+        """
+
+        msg = MIMEText(body, 'html')
+        msg['Subject'] = subject
+        msg['From'] = EMAIL_SENDER
+        msg['To'] = EMAIL_RECEIVER
+
+        # Connect to SMTP server and send
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls() # Secure the connection
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER.split(','), msg.as_string())
+
+        logging.info("Email notification sent successfully.")
+
+    except Exception as e:
+        logging.error(f"Error sending email notification: {e}")
+        logging.error("Please ensure SMTP server details, user, password, sender, and receiver are configured correctly.")
+else:
+    logging.warning("\nSkipping email notification: SMTP server details not fully provided.")
+    logging.warning("Set SMTP_SERVER, SMTP_USER, SMTP_PASSWORD, EMAIL_SENDER, and EMAIL_RECEIVER environment variables to enable.")
+
+
+# ==============================================================
+# Completion
+# ==============================================================
+
+logging.info("\nGCP resource deployment script completed.")
+logging.info(f"GCP Project ID: {GCP_PROJECT_ID}")
+logging.info(f"Terraform State Bucket: gs://{STATE_BUCKET_NAME}")
+logging.info(f"Terraform configuration in: {DEPLOYMENT_DIR}")
+
+# Provide connection information from outputs
+command_vm_ip = tf_outputs.get('command_vm_external_ip', {}).get('value')
+test1_vm_ip = tf_outputs.get('test_vm1_external_ip', {}).get('value')
+test2_vm_ip = tf_outputs.get('test_vm2_external_ip', {}).get('value')
+
+
+if command_vm_ip:
+    logging.info(f"Command VM ({tf_outputs.get('command_vm_name', {}).get('value', 'N/A')}) External IP: {command_vm_ip}")
+    logging.info(f"SSH command: ssh {ADMIN_USERNAME}@{command_vm_ip}")
+if test1_vm_ip:
+    logging.info(f"Test VM 1 ({tf_outputs.get('test_vm1_name', {}).get('value', 'N/A')}) External IP: {test1_vm_ip}")
+    logging.info(f"SSH command: ssh {ADMIN_USERNAME}@{test1_vm_ip}")
+if test2_vm_ip:
+     logging.info(f"Test VM 2 ({tf_outputs.get('test_vm2_name', {}).get('value', 'N/A')}) External IP: {test2_vm_ip}")
+     logging.info(f"SSH command: ssh {ADMIN_USERNAME}@{test2_vm_ip}")
+
+logging.info("\nReview Cloud Logging for detailed deployment logs.")
+logging.info(f"Review resources in the GCP Console for project: {GCP_PROJECT_ID}")
+
+# ==============================================================
+# Cleanup Note
+# ==============================================================
+logging.info("\nTo destroy resources created by this script, navigate to the:")
+logging.info(f"'{DEPLOYMENT_DIR}' directory and run: 'terraform destroy'")
+logging.info("Be cautious: This will delete all resources managed by the Terraform state.")

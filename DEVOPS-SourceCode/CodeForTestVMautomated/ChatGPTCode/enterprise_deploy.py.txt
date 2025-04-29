@@ -1,0 +1,224 @@
+# ==============================================================
+# Full Enterprise Azure Deployment Python Script
+# with Dynamic Auto-Tagging and GitHub Actions Integration
+# ==============================================================
+
+import os
+import time
+import random
+import string
+import requests
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.resource import ResourceManagementClient
+from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.network import NetworkManagementClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.mgmt.compute.models import DiskCreateOption
+from azure.mgmt.network.models import (VirtualNetwork, Subnet, PublicIPAddress, NetworkInterface)
+from azure.mgmt.compute.models import (VirtualMachine, HardwareProfile, StorageProfile, ImageReference, OSProfile, NetworkProfile, NetworkInterfaceReference)
+from azure.communication.email import EmailClient
+
+# ==============================================================
+# Configuration Section
+# ==============================================================
+
+LOCATION = "eastus"
+RESOURCE_GROUP_NAME = "rg-enterprise-auto"
+STORAGE_ACCOUNT_NAME = "storage" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+
+# VM Sizes
+COMMAND_VM_SIZE = "Standard_B1s"
+TEST_VM_SIZE = "Standard_B1s"
+
+# Admin credentials
+ADMIN_USERNAME = "azureadmin"
+ADMIN_PASSWORD = "ComplexP@ssw0rd123!"
+
+# Email Settings
+COMM_SERVICE_CONNECTION_STRING = os.getenv('AZURE_COMM_SERVICE_CONNECTION')  # set as secret
+EMAIL_SENDER = "your-sender@example.com"
+EMAIL_RECEIVER = "your-receiver@example.com"
+
+# ==============================================================
+# Dynamic Auto-Tagging Setup
+# ==============================================================
+
+def generate_dynamic_tags():
+    branch = os.getenv('GITHUB_REF', 'refs/heads/unknown').split('/')[-1]
+    actor = os.getenv('GITHUB_ACTOR', 'manual-run')
+
+    env_tag = "Dev" if branch != "main" else "Production"
+
+    tags = {
+        "Environment": env_tag,
+        "TriggeredBy": actor,
+        "Branch": branch,
+        "AutoCreated": "True",
+        "Project": "EnterpriseAutoDeploy"
+    }
+    return tags
+
+DYNAMIC_TAGS = generate_dynamic_tags()
+
+# ==============================================================
+# Azure Authentication
+# ==============================================================
+
+credential = DefaultAzureCredential()
+resource_client = ResourceManagementClient(credential, os.environ['AZURE_SUBSCRIPTION_ID'])
+compute_client = ComputeManagementClient(credential, os.environ['AZURE_SUBSCRIPTION_ID'])
+network_client = NetworkManagementClient(credential, os.environ['AZURE_SUBSCRIPTION_ID'])
+storage_client = StorageManagementClient(credential, os.environ['AZURE_SUBSCRIPTION_ID'])
+
+# ==============================================================
+# Resource Group Creation
+# ==============================================================
+
+print(f"Creating resource group: {RESOURCE_GROUP_NAME}")
+resource_client.resource_groups.create_or_update(RESOURCE_GROUP_NAME, {"location": LOCATION, "tags": DYNAMIC_TAGS})
+
+# ==============================================================
+# Networking Setup
+# ==============================================================
+
+print("Setting up Virtual Network and Subnet...")
+vnet_result = network_client.virtual_networks.begin_create_or_update(
+    RESOURCE_GROUP_NAME,
+    "vnet-main",
+    {
+        "location": LOCATION,
+        "address_space": {"address_prefixes": ["10.0.0.0/16"]}
+    }
+).result()
+
+subnet_result = network_client.subnets.begin_create_or_update(
+    RESOURCE_GROUP_NAME,
+    "vnet-main",
+    "subnet-main",
+    {"address_prefix": "10.0.0.0/24"}
+).result()
+
+# ==============================================================
+# Helper to Create Public IP
+# ==============================================================
+
+def create_public_ip(name):
+    return network_client.public_ip_addresses.begin_create_or_update(
+        RESOURCE_GROUP_NAME,
+        name,
+        {
+            "location": LOCATION,
+            "public_ip_allocation_method": "Dynamic"
+        }
+    ).result()
+
+# ==============================================================
+# Helper to Create NIC
+# ==============================================================
+
+def create_nic(name, subnet, public_ip):
+    return network_client.network_interfaces.begin_create_or_update(
+        RESOURCE_GROUP_NAME,
+        name,
+        {
+            "location": LOCATION,
+            "ip_configurations": [{
+                "name": "ipconfig1",
+                "subnet": {"id": subnet.id},
+                "public_ip_address": {"id": public_ip.id}
+            }]
+        }
+    ).result()
+
+# ==============================================================
+# Helper to Create VM
+# ==============================================================
+
+def create_vm(name, nic_id, size):
+    vm_parameters = {
+        "location": LOCATION,
+        "tags": DYNAMIC_TAGS,
+        "hardware_profile": HardwareProfile(vm_size=size),
+        "storage_profile": StorageProfile(
+            image_reference=ImageReference(
+                publisher="Canonical",
+                offer="UbuntuServer",
+                sku="18.04-LTS",
+                version="latest"
+            )
+        ),
+        "os_profile": OSProfile(
+            computer_name=name,
+            admin_username=ADMIN_USERNAME,
+            admin_password=ADMIN_PASSWORD
+        ),
+        "network_profile": NetworkProfile(
+            network_interfaces=[NetworkInterfaceReference(id=nic_id)]
+        )
+    }
+    creation = compute_client.virtual_machines.begin_create_or_update(
+        RESOURCE_GROUP_NAME, name, vm_parameters
+    )
+    return creation.result()
+
+# ==============================================================
+# Command VM Creation
+# ==============================================================
+
+print("Deploying Command VM...")
+cmd_pub_ip = create_public_ip("cmd-vm-ip")
+cmd_nic = create_nic("cmd-vm-nic", subnet_result, cmd_pub_ip)
+command_vm = create_vm("cmd-vm", cmd_nic.id, COMMAND_VM_SIZE)
+
+# ==============================================================
+# Test VMs Creation
+# ==============================================================
+
+print("Deploying Test VM 1...")
+test1_pub_ip = create_public_ip("test1-vm-ip")
+test1_nic = create_nic("test1-vm-nic", subnet_result, test1_pub_ip)
+test_vm1 = create_vm("test-vm1", test1_nic.id, TEST_VM_SIZE)
+
+print("Deploying Test VM 2...")
+test2_pub_ip = create_public_ip("test2-vm-ip")
+test2_nic = create_nic("test2-vm-nic", subnet_result, test2_pub_ip)
+test_vm2 = create_vm("test-vm2", test2_nic.id, TEST_VM_SIZE)
+
+# ==============================================================
+# Send Email with Public IPs
+# ==============================================================
+
+def send_ip_email():
+    email_client = EmailClient.from_connection_string(COMM_SERVICE_CONNECTION_STRING)
+
+    email_subject = "Azure Test VMs - Deployment IPs"
+    email_body = f"""
+    Your test VMs have been deployed successfully!
+
+    Test VM 1 Public IP: {test1_pub_ip.ip_address}
+    Test VM 2 Public IP: {test2_pub_ip.ip_address}
+
+    Environment: {DYNAMIC_TAGS.get('Environment')}
+    Triggered By: {DYNAMIC_TAGS.get('TriggeredBy')}
+    """
+
+    message = {
+        "senderAddress": EMAIL_SENDER,
+        "recipients": {"to": [{"address": EMAIL_RECEIVER}]},
+        "content": {
+            "subject": email_subject,
+            "plainText": email_body
+        }
+    }
+
+    poller = email_client.begin_send(message)
+    result = poller.result()
+    print(f"Email send result: {result}")
+
+send_ip_email()
+
+# ==============================================================
+# Finished!
+# ==============================================================
+
+print("Deployment and Notification complete.")

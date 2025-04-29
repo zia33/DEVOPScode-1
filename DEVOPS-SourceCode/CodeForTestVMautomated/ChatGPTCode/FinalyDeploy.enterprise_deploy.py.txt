@@ -1,0 +1,274 @@
+# ==============================================================
+# Unified Enterprise Deployment Script
+# (Azure Backend + Terraform Bootstrap + Deployment)
+# ==============================================================
+
+import os
+import random
+import string
+import subprocess
+import json
+import time
+from datetime import datetime
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.resource import ResourceManagementClient, PolicyClient
+from azure.mgmt.storage import StorageManagementClient
+from azure.storage.blob import BlobServiceClient, BlobClient
+from azure.mgmt.storage.models import (
+    StorageAccountCreateParameters,
+    Sku,
+    Kind,
+    ImmutabilityPolicyProperties,
+    DeleteRetentionPolicy
+)
+
+# ==============================================================
+# Configuration Section
+# ==============================================================
+
+LOCATION = "eastus"
+RESOURCE_GROUP_NAME = "rg-enterprise-auto"
+STORAGE_ACCOUNT_NAME = "storage" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+CONTAINER_NAME = "tfstate"
+STATE_FILE_NAME = "terraform.tfstate"
+POLICY_NAME = "auto-delete-90days"
+POLICY_DISPLAY_NAME = "Auto-Delete Resources After 90 Days"
+POLICY_ASSIGNMENT_NAME = "auto-delete-assign"
+TAGS = {
+    "Environment": "Production",
+    "Project": "EnterpriseAutoDeploy",
+    "AutoCreated": "True"
+}
+
+# Terraform Deployment Details
+DEPLOYMENT_DIR = "./deployment"
+TERRAFORM_FILE = "main.tf"
+
+# ==============================================================
+# Azure Authentication
+# ==============================================================
+
+credential = DefaultAzureCredential()
+subscription_id = os.environ["AZURE_SUBSCRIPTION_ID"]
+
+resource_client = ResourceManagementClient(credential, subscription_id)
+storage_client = StorageManagementClient(credential, subscription_id)
+policy_client = PolicyClient(credential, subscription_id)
+
+# ==============================================================
+# Resource Group Creation
+# ==============================================================
+
+print(f"Creating resource group: {RESOURCE_GROUP_NAME}")
+resource_client.resource_groups.create_or_update(
+    RESOURCE_GROUP_NAME,
+    {"location": LOCATION, "tags": TAGS}
+)
+
+# ==============================================================
+# Storage Account + Blob Container Creation
+# ==============================================================
+
+print(f"Creating Storage Account: {STORAGE_ACCOUNT_NAME}")
+storage_async_operation = storage_client.storage_accounts.begin_create(
+    RESOURCE_GROUP_NAME,
+    STORAGE_ACCOUNT_NAME,
+    StorageAccountCreateParameters(
+        sku=Sku(name="Standard_LRS"),
+        kind=Kind.STORAGE_V2,
+        location=LOCATION,
+        tags=TAGS
+    )
+)
+storage_account = storage_async_operation.result()
+
+# Get storage keys
+storage_keys = storage_client.storage_accounts.list_keys(RESOURCE_GROUP_NAME, STORAGE_ACCOUNT_NAME)
+storage_key = storage_keys.keys[0].value
+
+# Create Blob Container
+blob_service_client = BlobServiceClient(
+    f"https://{STORAGE_ACCOUNT_NAME}.blob.core.windows.net/",
+    credential=storage_key
+)
+
+print(f"Creating Blob Container: {CONTAINER_NAME}")
+try:
+    container_client = blob_service_client.create_container(CONTAINER_NAME)
+except Exception as e:
+    print(f"Container may already exist: {str(e)}")
+
+# Create an empty tfstate file
+print("Uploading empty terraform.tfstate file")
+blob_client = blob_service_client.get_blob_client(container=CONTAINER_NAME, blob=STATE_FILE_NAME)
+blob_client.upload_blob(b"{}", overwrite=True)
+
+# ==============================================================
+# Apply Soft Delete and Retention
+# ==============================================================
+
+print("Setting soft delete retention on Storage Account")
+storage_client.blob_services.set_service_properties(
+    RESOURCE_GROUP_NAME,
+    STORAGE_ACCOUNT_NAME,
+    "default",
+    delete_retention_policy=DeleteRetentionPolicy(enabled=True, days=90)
+)
+
+# ==============================================================
+# Auto-Delete Policy Creation
+# ==============================================================
+
+print("Creating Auto-Delete After 90 Days Policy")
+
+policy_rule = {
+    "if": {
+        "field": "tags['ExpirationDate']",
+        "exists": "false"
+    },
+    "then": {
+        "effect": "modify",
+        "details": {
+            "roleDefinitionIds": [
+                "/providers/microsoft.authorization/roleDefinitions/de139f84-1756-47ae-9be6-808fbbe84772"
+            ],
+            "operations": [
+                {
+                    "operation": "addOrReplace",
+                    "field": "tags.ExpirationDate",
+                    "value": "[utcNow('yyyy-MM-ddTHH:mm:ssZ')]"
+                },
+                {
+                    "operation": "addOrReplace",
+                    "field": "tags.DeleteAfter",
+                    "value": "[dateTimeAdd(utcNow(), 'P90D')]"
+                }
+            ]
+        }
+    }
+}
+
+policy_definition = {
+    "policyRule": policy_rule,
+    "parameters": {},
+    "displayName": POLICY_DISPLAY_NAME,
+    "mode": "Indexed"
+}
+
+policy = policy_client.policy_definitions.create_or_update(POLICY_NAME, policy_definition)
+
+scope = f"/subscriptions/{subscription_id}/resourceGroups/{RESOURCE_GROUP_NAME}"
+
+policy_assignment = policy_client.policy_assignments.create(
+    scope=scope,
+    policy_assignment_name=POLICY_ASSIGNMENT_NAME,
+    parameters={},
+    policy_assignment={
+        "policy_definition_id": policy.id,
+        "display_name": POLICY_DISPLAY_NAME
+    }
+)
+
+# ==============================================================
+# Generate Terraform Deployment Files
+# ==============================================================
+
+print("Generating Terraform Deployment Files")
+
+os.makedirs(DEPLOYMENT_DIR, exist_ok=True)
+
+terraform_main_content = f"""
+terraform {{
+  backend "azurerm" {{
+    resource_group_name  = "{RESOURCE_GROUP_NAME}"
+    storage_account_name = "{STORAGE_ACCOUNT_NAME}"
+    container_name       = "{CONTAINER_NAME}"
+    key                  = "{STATE_FILE_NAME}"
+  }}
+}}
+
+provider "azurerm" {{
+  features {{}}
+}}
+
+resource "azurerm_resource_group" "example" {{
+  name     = "rg-vm-deployment"
+  location = "{LOCATION}"
+}}
+
+resource "azurerm_virtual_network" "vnet" {{
+  name                = "vnet-example"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.example.location
+  resource_group_name = azurerm_resource_group.example.name
+}}
+
+resource "azurerm_subnet" "subnet" {{
+  name                 = "subnet-example"
+  resource_group_name  = azurerm_resource_group.example.name
+  virtual_network_name = azurerm_virtual_network.vnet.name
+  address_prefixes     = ["10.0.1.0/24"]
+}}
+
+resource "azurerm_network_interface" "nic" {{
+  name                = "nic-example"
+  location            = azurerm_resource_group.example.location
+  resource_group_name = azurerm_resource_group.example.name
+
+  ip_configuration {{
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.pip.id
+  }}
+}}
+
+resource "azurerm_public_ip" "pip" {{
+  name                = "pip-example"
+  location            = azurerm_resource_group.example.location
+  resource_group_name = azurerm_resource_group.example.name
+  allocation_method   = "Static"
+}}
+
+resource "azurerm_linux_virtual_machine" "vm" {{
+  name                = "vm-example"
+  resource_group_name = azurerm_resource_group.example.name
+  location            = azurerm_resource_group.example.location
+  size                = "Standard_B1s"
+  admin_username      = "azureuser"
+  network_interface_ids = [
+    azurerm_network_interface.nic.id,
+  ]
+  admin_ssh_key {{
+    username   = "azureuser"
+    public_key = file("~/.ssh/id_rsa.pub")
+  }}
+  os_disk {{
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }}
+  source_image_reference {{
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       = "20_04-lts"
+    version   = "latest"
+  }}
+}}
+"""
+
+terraform_file_path = os.path.join(DEPLOYMENT_DIR, TERRAFORM_FILE)
+with open(terraform_file_path, "w") as f:
+    f.write(terraform_main_content)
+
+# ==============================================================
+# Initialize and Apply Terraform
+# ==============================================================
+
+print("Initializing Terraform")
+
+subprocess.run(["terraform", "init"], cwd=DEPLOYMENT_DIR, check=True)
+print("Applying Terraform Plan")
+
+subprocess.run(["terraform", "apply", "-auto-approve"], cwd=DEPLOYMENT_DIR, check=True)
+
+print("\n\n=== ALL DEPLOYMENT DONE SUCCESSFULLY ===\n\n")

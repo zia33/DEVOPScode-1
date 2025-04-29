@@ -1,0 +1,18 @@
+# Configuration Section
+# Dynamic Auto-Tagging Setup
+# Azure Authentication
+# Resource Group Creation
+# Storage Account + Blob Container Creation
+# Apply Soft Delete and Retention
+# Auto-Delete Policy Creation
+# Generate Terraform Deployment Files
+# Initialize and Apply Terraform
+# Networking Setup (Redundant section removed)
+# Helper to Create Public IP
+# Helper to Create NIC
+# Helper to Create VM
+# Obtain Network Resource IDs from Terraform Output
+# Command VM Creation (using SDK)
+# Test VMs Creation (using SDK)
+# Send Email Notification (Optional)
+# Completion

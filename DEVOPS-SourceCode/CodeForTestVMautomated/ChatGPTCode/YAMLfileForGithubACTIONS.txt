@@ -1,0 +1,62 @@
+Create a file in your repo for Github Actions deployment through triggering.
+
+
+.github/workflows/azure_deploy.yml
+
+Inside it put the following YAML file contents.
+_________________________________________________
+
+# =========================================================
+# Azure Full Infrastructure Deployment - GitHub Actions Workflow
+# =========================================================
+name: Azure Infrastructure Automation
+
+on:
+  push:
+    branches:
+      - main  # You can change to any branch you prefer
+  workflow_dispatch:  # Allows manual trigger from GitHub UI
+  schedule:
+    - cron: '0 14 * * *'  # OPTIONAL: Scheduled daily run at 6AM PST (14 UTC)
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'  # Match the Python version you need
+
+      - name: Install Python Packages
+        run: |
+          pip install azure-identity azure-mgmt-resource azure-mgmt-compute azure-mgmt-network azure-mgmt-storage azure-communication-email paramiko requests
+
+      - name: Run Azure Deployment Script
+        run: |
+          python enterprise_deploy.py
+
+
+
+___________________________________________________________
+The entire CI/CD pipeline parts related to this script::::
+
+Edit Script ➔ Commit to GitHub ➔ GitHub Action Triggers ➔ Azure VMs Created/Updated ➔ Email Sent ➔ Snapshots Handled Automatically
+VISUALLY-------->
+[Git Push]
+     ↓
+[GitHub Actions triggers]
+     ↓
+[Azure Cloud deploys Infrastructure]
+     ↓
+[Receive Email with Test VMs Public IPs]

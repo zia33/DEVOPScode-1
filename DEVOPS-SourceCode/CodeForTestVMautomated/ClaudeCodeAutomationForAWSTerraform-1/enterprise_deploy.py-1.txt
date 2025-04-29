@@ -1,0 +1,848 @@
+import os
+import random
+import string
+import subprocess
+import time
+import json
+import boto3
+from botocore.exceptions import ClientError
+
+# ==============================================================
+# Configuration Section
+# ==============================================================
+
+REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to us-east-1, but allow override
+RESOURCE_GROUP_NAME = "enterprise-auto"  # Used for tagging resources with resource-group
+S3_BUCKET_NAME = "tfstate-" + ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+TERRAFORM_STATE_KEY = "terraform.tfstate"
+LIFECYCLE_POLICY_NAME = "auto-delete-90days"
+
+# EC2 Instance Types
+COMMAND_INSTANCE_TYPE = os.getenv("COMMAND_INSTANCE_TYPE", "t2.micro")
+TEST_INSTANCE_TYPE = os.getenv("TEST_INSTANCE_TYPE", "t2.micro")
+AMI_ID = os.getenv("AMI_ID", "ami-0c55b159cbfafe1f0")  # Amazon Linux 2 AMI (replace with region-specific AMI)
+
+# Admin credentials
+SSH_KEY_NAME = os.getenv("SSH_KEY_NAME", "enterprise-auto-key")
+
+# Email Settings
+SNS_TOPIC_ARN = os.getenv('AWS_SNS_TOPIC_ARN', '')
+EMAIL_SENDER = os.getenv('EMAIL_SENDER', "your-sender@example.com")
+EMAIL_RECEIVER = os.getenv('EMAIL_RECEIVER', "your-receiver@example.com")
+
+# Terraform Deployment Details
+DEPLOYMENT_DIR = "./deployment"
+TERRAFORM_FILE = "main.tf"
+
+# ==============================================================
+# Dynamic Auto-Tagging Setup
+# ==============================================================
+
+def generate_dynamic_tags():
+    """Generates dynamic tags based on environment variables (like GitHub Actions)."""
+    branch = os.getenv('GITHUB_REF', 'refs/heads/unknown').split('/')[-1]
+    actor = os.getenv('GITHUB_ACTOR', 'manual-run')
+
+    # Determine environment tag
+    env_tag = "Dev"
+    if branch == "main":
+        env_tag = "Production"
+    elif branch.startswith("release"):
+        env_tag = "Staging"
+
+    tags = {
+        "Environment": env_tag,
+        "TriggeredBy": actor,
+        "Branch": branch,
+        "AutoCreated": "True",
+        "Project": "EnterpriseAutoDeploy",
+        # Add creation time tag
+        "CreationDate": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        # Add resource group tag (AWS doesn't have resource groups like Azure)
+        "ResourceGroup": RESOURCE_GROUP_NAME
+    }
+    return tags
+
+DYNAMIC_TAGS = generate_dynamic_tags()
+
+# ==============================================================
+# AWS Authentication and Session Setup
+# ==============================================================
+
+try:
+    # Create AWS session using environment variables or AWS config
+    session = boto3.Session(region_name=REGION)
+    
+    # Create service clients
+    s3_client = session.client('s3')
+    ec2_client = session.client('ec2')
+    ec2_resource = session.resource('ec2')
+    iam_client = session.client('iam')
+    sns_client = session.client('sns')
+    
+    # Check if credentials are valid
+    sts_client = session.client('sts')
+    account_id = sts_client.get_caller_identity()["Account"]
+    print(f"Successfully authenticated with AWS account: {account_id}")
+    
+except ClientError as e:
+    print(f"Authentication Error: {e}")
+    print("Please ensure you are authenticated to AWS (e.g., via AWS CLI, environment variables, etc.)")
+    exit(1)
+except Exception as e:
+    print(f"An unexpected error occurred during AWS authentication: {e}")
+    exit(1)
+
+# ==============================================================
+# Resource Group Tagging (AWS doesn't have Resource Groups like Azure, 
+# but we can use tags to simulate them)
+# ==============================================================
+
+print(f"Setting up resource tagging for group: {RESOURCE_GROUP_NAME}")
+# In AWS, we use tags to group resources instead of Azure's Resource Groups
+# No need to create an actual resource, but we'll use this tag in all resources
+
+# ==============================================================
+# S3 Bucket Creation (for Terraform State)
+# ==============================================================
+
+print(f"Creating S3 Bucket: {S3_BUCKET_NAME}")
+try:
+    # Check if bucket exists
+    bucket_exists = False
+    try:
+        s3_client.head_bucket(Bucket=S3_BUCKET_NAME)
+        bucket_exists = True
+        print(f"S3 bucket '{S3_BUCKET_NAME}' already exists.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            pass  # Bucket doesn't exist, create it
+        else:
+            raise
+
+    if not bucket_exists:
+        # Create bucket
+        s3_client.create_bucket(
+            Bucket=S3_BUCKET_NAME,
+            CreateBucketConfiguration={'LocationConstraint': REGION} if REGION != 'us-east-1' else {}
+        )
+        
+        # Add bucket tags
+        s3_client.put_bucket_tagging(
+            Bucket=S3_BUCKET_NAME,
+            Tagging={
+                'TagSet': [{'Key': k, 'Value': v} for k, v in DYNAMIC_TAGS.items()]
+            }
+        )
+        
+        print(f"S3 bucket '{S3_BUCKET_NAME}' created and tagged.")
+        
+        # Enable versioning (equivalent to Azure's soft delete)
+        s3_client.put_bucket_versioning(
+            Bucket=S3_BUCKET_NAME,
+            VersioningConfiguration={'Status': 'Enabled'}
+        )
+        print("S3 bucket versioning enabled.")
+        
+        # Set up lifecycle policy (90 days expiration for non-current versions)
+        lifecycle_config = {
+            'Rules': [
+                {
+                    'ID': LIFECYCLE_POLICY_NAME,
+                    'Status': 'Enabled',
+                    'Prefix': '',  # Apply to all objects
+                    'NoncurrentVersionExpiration': {'NoncurrentDays': 90},
+                    'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 7}
+                }
+            ]
+        }
+        s3_client.put_bucket_lifecycle_configuration(
+            Bucket=S3_BUCKET_NAME,
+            LifecycleConfiguration=lifecycle_config
+        )
+        print("S3 bucket lifecycle policy configured.")
+        
+        # Set up default encryption
+        s3_client.put_bucket_encryption(
+            Bucket=S3_BUCKET_NAME,
+            ServerSideEncryptionConfiguration={
+                'Rules': [
+                    {
+                        'ApplyServerSideEncryptionByDefault': {
+                            'SSEAlgorithm': 'AES256'
+                        }
+                    }
+                ]
+            }
+        )
+        print("S3 bucket encryption enabled.")
+    
+    # Create empty tfstate file if it doesn't exist
+    try:
+        s3_client.head_object(Bucket=S3_BUCKET_NAME, Key=TERRAFORM_STATE_KEY)
+        print(f"{TERRAFORM_STATE_KEY} already exists in S3 bucket.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == '404':
+            s3_client.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=TERRAFORM_STATE_KEY,
+                Body=b'{}',
+                ContentType='application/json'
+            )
+            print(f"Empty {TERRAFORM_STATE_KEY} created in S3 bucket.")
+        else:
+            raise
+        
+except Exception as e:
+    print(f"Error setting up S3 bucket: {e}")
+    exit(1)
+
+# ==============================================================
+# IAM Role for Resource Tagging (equivalent to Azure's policy assignment)
+# ==============================================================
+
+print("Creating IAM Role for Resource Tagging")
+try:
+    # Define policy document for auto-tagging
+    auto_tag_policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "ec2:CreateTags",
+                    "ec2:DeleteTags"
+                ],
+                "Resource": "*",
+                "Condition": {
+                    "StringEquals": {
+                        "aws:RequestTag/AutoCreated": "True"
+                    }
+                }
+            }
+        ]
+    }
+    
+    # Create IAM policy
+    policy_name = "AutoTaggingPolicy"
+    try:
+        # Check if policy exists
+        iam_client.get_policy(PolicyArn=f"arn:aws:iam::{account_id}:policy/{policy_name}")
+        print(f"IAM policy '{policy_name}' already exists.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchEntity':
+            # Create policy
+            response = iam_client.create_policy(
+                PolicyName=policy_name,
+                PolicyDocument=json.dumps(auto_tag_policy_document),
+                Description="Policy for automatic resource tagging"
+            )
+            print(f"IAM policy '{policy_name}' created.")
+        else:
+            raise
+    
+    # Create IAM role that can be assumed by EC2
+    role_name = "AutoTaggingRole"
+    try:
+        # Check if role exists
+        iam_client.get_role(RoleName=role_name)
+        print(f"IAM role '{role_name}' already exists.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchEntity':
+            # Create role
+            assume_role_policy_document = {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": {"Service": "ec2.amazonaws.com"},
+                        "Action": "sts:AssumeRole"
+                    }
+                ]
+            }
+            
+            response = iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps(assume_role_policy_document),
+                Description="Role for automatic resource tagging"
+            )
+            
+            # Attach policy to role
+            iam_client.attach_role_policy(
+                RoleName=role_name,
+                PolicyArn=f"arn:aws:iam::{account_id}:policy/{policy_name}"
+            )
+            
+            print(f"IAM role '{role_name}' created and policy attached.")
+        else:
+            raise
+    
+    # Create instance profile for the role
+    instance_profile_name = "AutoTaggingProfile"
+    try:
+        iam_client.get_instance_profile(InstanceProfileName=instance_profile_name)
+        print(f"Instance profile '{instance_profile_name}' already exists.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchEntity':
+            # Create instance profile
+            iam_client.create_instance_profile(InstanceProfileName=instance_profile_name)
+            
+            # Add role to instance profile
+            iam_client.add_role_to_instance_profile(
+                InstanceProfileName=instance_profile_name,
+                RoleName=role_name
+            )
+            
+            print(f"Instance profile '{instance_profile_name}' created and role attached.")
+        else:
+            raise
+    
+except Exception as e:
+    print(f"Error setting up IAM role for resource tagging: {e}")
+    # Continue with the script as this is not critical
+
+# ==============================================================
+# SSH Key Pair Setup (if needed)
+# ==============================================================
+
+print(f"Checking for SSH key pair: {SSH_KEY_NAME}")
+try:
+    # Check if key pair exists
+    try:
+        ec2_client.describe_key_pairs(KeyNames=[SSH_KEY_NAME])
+        print(f"SSH key pair '{SSH_KEY_NAME}' already exists.")
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'InvalidKeyPair.NotFound':
+            # Create key pair
+            response = ec2_client.create_key_pair(KeyName=SSH_KEY_NAME)
+            
+            # Save the private key to a file
+            private_key = response['KeyMaterial']
+            key_file_path = f"./{SSH_KEY_NAME}.pem"
+            with open(key_file_path, 'w') as key_file:
+                key_file.write(private_key)
+            
+            # Set correct permissions
+            os.chmod(key_file_path, 0o400)
+            
+            print(f"SSH key pair '{SSH_KEY_NAME}' created and saved to {key_file_path}")
+        else:
+            raise
+    
+except Exception as e:
+    print(f"Error setting up SSH key pair: {e}")
+    exit(1)
+
+# ==============================================================
+# Generate Terraform Deployment Files
+# ==============================================================
+
+print("\nGenerating Terraform Deployment Files...")
+
+os.makedirs(DEPLOYMENT_DIR, exist_ok=True)
+
+terraform_main_content = f"""
+terraform {{
+  backend "s3" {{
+    bucket         = "{S3_BUCKET_NAME}"
+    key            = "{TERRAFORM_STATE_KEY}"
+    region         = "{REGION}"
+    encrypt        = true
+  }}
+}}
+
+provider "aws" {{
+  region = "{REGION}"
+}}
+
+locals {{
+  common_tags = {{
+    Environment = "{DYNAMIC_TAGS.get('Environment', 'Unknown')}"
+    TriggeredBy = "{DYNAMIC_TAGS.get('TriggeredBy', 'Unknown')}"
+    Branch      = "{DYNAMIC_TAGS.get('Branch', 'Unknown')}"
+    AutoCreated = "True"
+    Project     = "EnterpriseAutoDeploy"
+    ResourceGroup = "{RESOURCE_GROUP_NAME}"
+    CreationDate = "{DYNAMIC_TAGS.get('CreationDate', 'Unknown')}"
+  }}
+}}
+
+# Create a VPC
+resource "aws_vpc" "main" {{
+  cidr_block = "10.0.0.0/16"
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "enterprise-vpc"
+    }}
+  )
+}}
+
+# Create an internet gateway
+resource "aws_internet_gateway" "gw" {{
+  vpc_id = aws_vpc.main.id
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "enterprise-igw"
+    }}
+  )
+}}
+
+# Create a subnet
+resource "aws_subnet" "main" {{
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "{REGION}a"
+  map_public_ip_on_launch = true
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "enterprise-subnet"
+    }}
+  )
+}}
+
+# Create a route table
+resource "aws_route_table" "rt" {{
+  vpc_id = aws_vpc.main.id
+  
+  route {{
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.gw.id
+  }}
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "enterprise-route-table"
+    }}
+  )
+}}
+
+# Associate subnet with route table
+resource "aws_route_table_association" "a" {{
+  subnet_id      = aws_subnet.main.id
+  route_table_id = aws_route_table.rt.id
+}}
+
+# Create a security group
+resource "aws_security_group" "sg" {{
+  name        = "enterprise-sg"
+  description = "Allow SSH and common inbound traffic"
+  vpc_id      = aws_vpc.main.id
+  
+  ingress {{
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "SSH access"
+  }}
+  
+  ingress {{
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTP access"
+  }}
+  
+  ingress {{
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "HTTPS access"
+  }}
+  
+  egress {{
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+    description = "Allow all outbound traffic"
+  }}
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "enterprise-security-group"
+    }}
+  )
+}}
+
+# Create an EC2 instance
+resource "aws_instance" "main" {{
+  ami                    = "{AMI_ID}"
+  instance_type          = "{TEST_INSTANCE_TYPE}"
+  subnet_id              = aws_subnet.main.id
+  vpc_security_group_ids = [aws_security_group.sg.id]
+  key_name               = "{SSH_KEY_NAME}"
+  
+  root_block_device {{
+    volume_type           = "gp2"
+    volume_size           = 8
+    delete_on_termination = true
+  }}
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "terraform-instance"
+    }}
+  )
+}}
+
+# Elastic IP for the instance
+resource "aws_eip" "instance_eip" {{
+  instance = aws_instance.main.id
+  domain   = "vpc"
+  
+  tags = merge(
+    local.common_tags,
+    {{
+      Name = "terraform-instance-eip"
+    }}
+  )
+}}
+
+# Output the public IP
+output "instance_public_ip" {{
+  value = aws_eip.instance_eip.public_ip
+}}
+
+# Output the VPC ID for use in SDK deployments
+output "vpc_id" {{
+  value = aws_vpc.main.id
+}}
+
+# Output the subnet ID for use in SDK deployments
+output "subnet_id" {{
+  value = aws_subnet.main.id
+}}
+
+# Output the security group ID for use in SDK deployments
+output "security_group_id" {{
+  value = aws_security_group.sg.id
+}}
+"""
+
+terraform_file_path = os.path.join(DEPLOYMENT_DIR, TERRAFORM_FILE)
+try:
+    with open(terraform_file_path, "w") as f:
+        f.write(terraform_main_content)
+    print(f"Terraform file '{terraform_file_path}' generated successfully.")
+except IOError as e:
+    print(f"Error writing Terraform file '{terraform_file_path}': {e}")
+    exit(1)
+
+# ==============================================================
+# Initialize and Apply Terraform
+# ==============================================================
+
+print("\nInitializing Terraform...")
+try:
+    subprocess.run(["terraform", "init", "-upgrade"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    print("Terraform initialization successful.")
+except subprocess.CalledProcessError as e:
+    print(f"Error initializing Terraform: {e.stderr}")
+    exit(1)
+
+print("Applying Terraform Plan...")
+try:
+    # Add -input=false for non-interactive apply in automation
+    subprocess.run(["terraform", "apply", "-auto-approve", "-input=false"], cwd=DEPLOYMENT_DIR, check=True, capture_output=True, text=True)
+    print("Terraform apply successful.")
+except subprocess.CalledProcessError as e:
+    print(f"Error applying Terraform plan: {e.stderr}")
+    exit(1)
+except FileNotFoundError:
+    print("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+    exit(1)
+
+# ==============================================================
+# Retrieve Terraform Output for Further AWS SDK Deployment
+# ==============================================================
+
+print("\nRetrieving resource IDs from Terraform output...")
+try:
+    # Run terraform output to get the IDs of resources created by Terraform
+    tf_output_process = subprocess.run(
+        ["terraform", "output", "-json"],
+        cwd=DEPLOYMENT_DIR,
+        check=True,
+        capture_output=True,
+        text=True
+    )
+    tf_output = json.loads(tf_output_process.stdout)
+    
+    # Extract resource IDs
+    vpc_id = tf_output.get("vpc_id", {}).get("value")
+    subnet_id = tf_output.get("subnet_id", {}).get("value")
+    security_group_id = tf_output.get("security_group_id", {}).get("value")
+    instance_public_ip = tf_output.get("instance_public_ip", {}).get("value")
+    
+    if not vpc_id or not subnet_id or not security_group_id:
+        raise ValueError("One or more required Terraform outputs not found.")
+        
+    print(f"VPC ID: {vpc_id}")
+    print(f"Subnet ID: {subnet_id}")
+    print(f"Security Group ID: {security_group_id}")
+    print(f"Terraform Instance Public IP: {instance_public_ip}")
+    
+except FileNotFoundError:
+    print("Error: 'terraform' command not found. Please ensure Terraform is installed and in your PATH.")
+    exit(1)
+except subprocess.CalledProcessError as e:
+    print(f"Error running 'terraform output': {e.stderr}")
+    exit(1)
+except json.JSONDecodeError:
+    print("Error decoding Terraform output JSON.")
+    exit(1)
+except ValueError as e:
+    print(f"Error: {e}")
+    exit(1)
+
+# ==============================================================
+# Helper Function to Create EC2 Instances
+# ==============================================================
+
+def create_ec2_instance(name, instance_type, subnet_id, security_group_id):
+    """Creates an EC2 instance with the given parameters."""
+    print(f"Creating EC2 instance: {name}")
+    try:
+        # Check if an instance with this name already exists
+        instances = ec2_client.describe_instances(
+            Filters=[
+                {'Name': 'tag:Name', 'Values': [name]},
+                {'Name': 'instance-state-name', 'Values': ['pending', 'running', 'stopping', 'stopped']}
+            ]
+        )
+        
+        if instances['Reservations']:
+            instance_id = instances['Reservations'][0]['Instances'][0]['InstanceId']
+            print(f"Instance '{name}' already exists with ID: {instance_id}")
+            return instance_id
+        
+        # Create the instance
+        response = ec2_client.run_instances(
+            ImageId=AMI_ID,
+            InstanceType=instance_type,
+            MinCount=1,
+            MaxCount=1,
+            KeyName=SSH_KEY_NAME,
+            SubnetId=subnet_id,
+            SecurityGroupIds=[security_group_id],
+            TagSpecifications=[
+                {
+                    'ResourceType': 'instance',
+                    'Tags': [{'Key': 'Name', 'Value': name}] + 
+                           [{'Key': k, 'Value': v} for k, v in DYNAMIC_TAGS.items()]
+                },
+                {
+                    'ResourceType': 'volume',
+                    'Tags': [{'Key': 'Name', 'Value': f"{name}-volume"}] + 
+                           [{'Key': k, 'Value': v} for k, v in DYNAMIC_TAGS.items()]
+                }
+            ]
+        )
+        
+        instance_id = response['Instances'][0]['InstanceId']
+        
+        # Wait for the instance to be running
+        print(f"Waiting for instance '{name}' to be running...")
+        waiter = ec2_client.get_waiter('instance_running')
+        waiter.wait(InstanceIds=[instance_id])
+        
+        print(f"Instance '{name}' created with ID: {instance_id}")
+        
+        # Create and attach an Elastic IP
+        eip_response = ec2_client.allocate_address(
+            Domain='vpc',
+            TagSpecifications=[
+                {
+                    'ResourceType': 'elastic-ip',
+                    'Tags': [{'Key': 'Name', 'Value': f"{name}-eip"}] + 
+                           [{'Key': k, 'Value': v} for k, v in DYNAMIC_TAGS.items()]
+                }
+            ]
+        )
+        
+        allocation_id = eip_response['AllocationId']
+        public_ip = eip_response['PublicIp']
+        
+        ec2_client.associate_address(
+            AllocationId=allocation_id,
+            InstanceId=instance_id
+        )
+        
+        print(f"Elastic IP {public_ip} associated with instance '{name}'")
+        
+        return instance_id, public_ip
+        
+    except Exception as e:
+        print(f"Error creating EC2 instance '{name}': {e}")
+        return None
+
+# ==============================================================
+# Command and Test Instance Creation (using AWS SDK)
+# ==============================================================
+
+# Create Command Instance
+print("\nDeploying Command Instance (using AWS SDK)...")
+try:
+    command_instance_result = create_ec2_instance(
+        "command-instance", 
+        COMMAND_INSTANCE_TYPE, 
+        subnet_id, 
+        security_group_id
+    )
+    
+    if command_instance_result:
+        command_instance_id, command_public_ip = command_instance_result
+        print(f"Command Instance created with ID: {command_instance_id} and Public IP: {command_public_ip}")
+    else:
+        print("Failed to create Command Instance.")
+except Exception as e:
+    print(f"Error deploying Command Instance: {e}")
+
+# Create Test Instance 1
+print("\nDeploying Test Instance 1 (using AWS SDK)...")
+try:
+    test1_instance_result = create_ec2_instance(
+        "test-instance-1", 
+        TEST_INSTANCE_TYPE, 
+        subnet_id, 
+        security_group_id
+    )
+    
+    if test1_instance_result:
+        test1_instance_id, test1_public_ip = test1_instance_result
+        print(f"Test Instance 1 created with ID: {test1_instance_id} and Public IP: {test1_public_ip}")
+    else:
+        print("Failed to create Test Instance 1.")
+except Exception as e:
+    print(f"Error deploying Test Instance 1: {e}")
+
+# Create Test Instance 2
+print("\nDeploying Test Instance 2 (using AWS SDK)...")
+try:
+    test2_instance_result = create_ec2_instance(
+        "test-instance-2", 
+        TEST_INSTANCE_TYPE, 
+        subnet_id, 
+        security_group_id
+    )
+    
+    if test2_instance_result:
+        test2_instance_id, test2_public_ip = test2_instance_result
+        print(f"Test Instance 2 created with ID: {test2_instance_id} and Public IP: {test2_public_ip}")
+    else:
+        print("Failed to create Test Instance 2.")
+except Exception as e:
+    print(f"Error deploying Test Instance 2: {e}")
+
+# ==============================================================
+# Send Email Notification (using SNS)
+# ==============================================================
+
+if SNS_TOPIC_ARN and EMAIL_SENDER and EMAIL_RECEIVER:
+    print("\nSending email notification via SNS...")
+    try:
+        # Format the email body
+        subject = f"AWS Automated Deployment Status - {DYNAMIC_TAGS.get('Environment', 'Unknown')}"
+        message = f"""
+        Automated AWS Resource Deployment Complete
+        
+        Deployment Information:
+        - Triggered by: {DYNAMIC_TAGS.get('TriggeredBy', 'N/A')}
+        - Branch: {DYNAMIC_TAGS.get('Branch', 'N/A')}
+        - Resource Group Tag: {RESOURCE_GROUP_NAME}
+        - Region: {REGION}
+        - Creation Time: {DYNAMIC_TAGS.get('CreationDate', 'N/A')}
+        
+        Deployed Resources:
+        - S3 Bucket (for TFState): {S3_BUCKET_NAME}
+        - VPC: {vpc_id}
+        - Subnet: {subnet_id}
+        - Security Group: {security_group_id}
+        - Terraform Instance: terraform-instance (Type: {TEST_INSTANCE_TYPE}, Public IP: {instance_public_ip})
+        - Command Instance: command-instance (Type: {COMMAND_INSTANCE_TYPE}, Public IP: {command_public_ip if 'command_public_ip' in locals() else 'N/A'})
+        - Test Instance 1: test-instance-1 (Type: {TEST_INSTANCE_TYPE}, Public IP: {test1_public_ip if 'test1_public_ip' in locals() else 'N/A'})
+        - Test Instance 2: test-instance-2 (Type: {TEST_INSTANCE_TYPE}, Public IP: {test2_public_ip if 'test2_public_ip' in locals() else 'N/A'})
+        
+        Resources are tagged with "AutoCreated": "True" and will be subject to lifecycle policies.
+        
+        Thank you!
+        """
+        
+        # Publish to SNS topic
+        response = sns_client.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=message
+        )
+        
+        print(f"Email notification sent with message ID: {response['MessageId']}")
+        
+    except Exception as e:
+        print(f"Error sending email notification: {e}")
+        print("Please ensure SNS topic ARN is correctly configured.")
+else:
+    print("\nSkipping email notification: SNS topic ARN or email details not provided.")
+    print("Set AWS_SNS_TOPIC_ARN, EMAIL_SENDER, and EMAIL_RECEIVER environment variables to enable.")
+
+# ==============================================================
+# Create GitHub Actions Workflow File
+# ==============================================================
+
+print("\nGenerating GitHub Actions workflow file...")
+
+# Create .github/workflows directory if it doesn't exist
+github_workflows_dir = "./.github/workflows"
+os.makedirs(github_workflows_dir, exist_ok=True)
+
+# Create the workflow file
+github_workflow_content = """name: AWS Enterprise Auto Deploy
+
+on:
+  push:
+    branches: [ main, develop, 'release/*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  AWS_REGION: us-east-1  # Change as needed
+  TF_VERSION: 1.5.0
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for AWS OIDC authentication
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python
