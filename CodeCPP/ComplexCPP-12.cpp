@@ -1,4 +1,5 @@
-// Unified Hierarchical Design with Production-Ready Enhancements
+// [Feature: Unified Hierarchical Design]
+// The entire code is structured around a low-level memory allocator and a high-level object pool.
 #include <iostream>
 #include <array>
 #include <queue>
@@ -51,7 +52,8 @@ inline int numa_available() { return -1; }
 inline int numa_tonode_memory(void*, size_t, int) { return 0; }
 #endif
 
-// ---------------- Logger with Auditing and Telemetry ----------------
+// [Feature: Dynamic Logging and Auditing]
+// New Logger class with dynamic levels and auditing capabilities.
 class Logger {
 public:
     enum class Level { DEBUG, INFO, WARNING, ERROR };
@@ -66,8 +68,9 @@ public:
                 case Level::ERROR: prefix = "[ERROR] "; break;
             }
             std::cout << prefix << message << "\n";
+            // [Feature: Auditing]
+            // Simulate sending to an auditing service or immutable log.
             if (level == Level::ERROR) {
-                // Simulate sending to audit service
                 // send_to_audit_service(message);
             }
         }
@@ -90,7 +93,28 @@ struct VerbosePolicy {
     }
 };
 
-// ---------------- Benchmarking ----------------
+// [Feature: Policy-Based Design]
+// New concepts for modularity.
+
+// [Feature: Configurable Locking Strategies]
+template <typename T>
+concept Lockable = requires(T a) {
+    a.lock();
+    a.unlock();
+};
+
+struct MutexPolicy { using Lock = std::mutex; };
+struct SharedMutexPolicy { using Lock = std::shared_mutex; };
+struct AtomicFlagPolicy { using Lock = std::atomic_flag; };
+
+// [Feature: Pluggable ObjectAllocationStrategy]
+// ObjectAllocationStrategy concept for future pluggable allocators.
+template <typename T>
+concept ObjectAllocationStrategy = requires(T a, size_t capacity) {
+    a.grow_pool(capacity);
+};
+
+// [Feature: Built-in Benchmarking]
 class BenchmarkTimer {
 private:
     std::chrono::high_resolution_clock::time_point start;
@@ -102,25 +126,7 @@ public:
     }
 };
 
-// ---------------- Locking Strategies ----------------
-template <typename T>
-concept Lockable = requires(T a) {
-    a.lock();
-    a.unlock();
-};
-
-struct MutexPolicy { using Lock = std::mutex; };
-struct SharedMutexPolicy { using Lock = std::shared_mutex; };
-struct AtomicFlagPolicy { using Lock = std::atomic_flag; };
-
-// ---------------- Allocation Policy Concept ----------------
-template <typename T>
-concept AllocationPolicy = requires(T a, size_t size, const std::string& tag) {
-    { a.allocate(size, tag) } -> std::same_as<void*>;
-    a.deallocate(nullptr);
-};
-
-// ---------------- Fine-Grained Locking ----------------
+// [Feature: Advanced, Granular Locking]
 class FineGrainedLockable {
 private:
     std::vector<std::mutex> object_locks;
@@ -219,7 +225,6 @@ public:
         Logger::log(Logger::Level::ERROR, "Deallocation failed: pointer not found");
     }
 
-    // ... [Remaining UltraAllocator methods will continue in Part 2]
     void compactAndDefragment() {
         std::lock_guard<std::mutex> lock(allocatorMutex);
         std::vector<Block> newBlocks;
@@ -394,7 +399,184 @@ private:
     }
 };
 
-// ---------------- Ref Wrapper ----------------
+class AnyTask {
+    struct ITask {
+        virtual ~ITask() = default;
+        virtual void run() = 0;
+    };
+    template <typename T>
+    struct TaskImpl : ITask {
+        T task;
+        TaskImpl(T&& t) : task(std::move(t)) {}
+        void run() override { task.run(); }
+    };
+    std::unique_ptr<ITask> task;
+public:
+    template <typename T>
+    AnyTask(T&& t) : task(std::make_unique<TaskImpl<T>>(std::forward<T>(t))) {}
+    void run() { if(task) task->run(); }
+};
+
+template<typename T, typename Policy = SilentPolicy>
+class ObjectPool {
+public:
+    // [Feature: Object State Management]
+    enum class ObjectState { NEW, IN_USE, PENDING_GC };
+    // [Feature: Generational Garbage Collection (Simplified)]
+    enum class Generation { YOUNG, OLD };
+
+private:
+    struct Entry {
+        alignas(T) char data[sizeof(T)];
+        std::atomic<int> ref_count{0};
+        std::mutex mtx; // [Feature: Advanced, Granular Locking]
+        ObjectState state = ObjectState::NEW;
+        Generation generation = Generation::YOUNG;
+        std::function<void(T*)> finalizer; // [Feature: Object Finalizers]
+    };
+    std::vector<Entry> pool; // [Feature: Dynamic Pool Scaling]
+    size_t capacity = 0;
+    std::atomic<size_t> used_count_atomic{0};
+    std::mutex gc_mtx;
+    std::condition_variable gc_cv;
+    std::atomic<bool> stop_gc{false};
+    std::queue<size_t> gc_young_queue;
+    std::queue<size_t> gc_old_queue;
+    std::jthread gc_thread;
+
+    void start_gc_coroutine() {
+        auto gc_task = [this]() -> std::generator<void> {
+            while (!stop_gc) {
+                std::unique_lock<std::mutex> lock(gc_mtx);
+                gc_cv.wait(lock, [&]{ return !gc_young_queue.empty() || !gc_old_queue.empty() || stop_gc; });
+                lock.unlock();
+
+                if (stop_gc) co_return;
+
+                // [Feature: Generational Garbage Collection (Simplified)]
+                // Prioritize cleaning the young generation
+                while(!gc_young_queue.empty() || !gc_old_queue.empty()){
+                    size_t idx;
+                    bool is_young = !gc_young_queue.empty();
+                    
+                    if(is_young){
+                        std::lock_guard<std::mutex> young_lock(gc_mtx);
+                        if(gc_young_queue.empty()) continue;
+                        idx = gc_young_queue.front();
+                        gc_young_queue.pop();
+                    } else {
+                        std::lock_guard<std::mutex> old_lock(gc_mtx);
+                        if(gc_old_queue.empty()) continue;
+                        idx = gc_old_queue.front();
+                        gc_old_queue.pop();
+                    }
+
+                    auto& e = pool[idx];
+                    std::lock_guard<std::mutex> entry_lock(e.mtx);
+                    
+                    if (e.ref_count.load() == 0 && e.state == ObjectState::PENDING_GC) {
+                        if (e.finalizer) e.finalizer(reinterpret_cast<T*>(e.data));
+                        reinterpret_cast<T*>(e.data)->~T();
+                        e.state = ObjectState::NEW;
+                        e.generation = Generation::YOUNG;
+                        Policy::on_deallocate(idx);
+                        used_count_atomic--;
+                    }
+                }
+            }
+        };
+        gc_thread = std::jthread([task = gc_task()] mutable { for (auto _ : task) {} });
+    }
+
+public:
+    explicit ObjectPool(size_t initial_capacity = 16) : capacity(initial_capacity) {
+        pool.resize(capacity);
+        start_gc_coroutine();
+    }
+    ~ObjectPool() {
+        stop_gc = true;
+        gc_cv.notify_all();
+    }
+    
+    void grow_pool() {
+        // [Feature: Dynamic Pool Scaling]
+        size_t new_capacity = capacity * 2;
+        pool.resize(new_capacity);
+        capacity = new_capacity;
+        Logger::log(Logger::Level::INFO, "ObjectPool scaled up. New capacity: " + std::to_string(capacity));
+    }
+    
+    template<typename... Args>
+    std::expected<T*, std::string> allocate(Args&&... args) {
+        // [Feature: Built-in Benchmarking]
+        BenchmarkTimer timer;
+        timer.startTimer();
+        
+        while (true) {
+            for (size_t i = 0; i < capacity; ++i) {
+                Entry& e = pool[i];
+                std::lock_guard<std::mutex> lock(e.mtx);
+                if (e.state == ObjectState::NEW) {
+                    try {
+                        e.state = ObjectState::IN_USE;
+                        new(e.data) T(std::forward<Args>(args)...);
+                        e.ref_count.store(1);
+                        Policy::on_allocate(i);
+                        used_count_atomic++;
+                        // [Feature: Telemetry Hooks]
+                        // telemetry_hook_allocate(timer.stopTimer());
+                        return reinterpret_cast<T*>(e.data);
+                    } catch (...) {
+                        e.state = ObjectState::NEW;
+                        return std::unexpected("Constructor failed.");
+                    }
+                }
+            }
+            grow_pool();
+        }
+    }
+    
+    void add_ref(T* ptr) {
+        if (auto* e = get_entry(ptr)) e->ref_count.fetch_add(1);
+    }
+    
+    void release(T* ptr) {
+        if (auto* e = get_entry(ptr)) {
+            if (e->ref_count.fetch_sub(1) == 1) {
+                e->state = ObjectState::PENDING_GC;
+                std::lock_guard<std::mutex> lock(gc_mtx);
+                if (e->generation == Generation::YOUNG) {
+                    gc_young_queue.push(e - pool.data());
+                } else {
+                    gc_old_queue.push(e - pool.data());
+                }
+                gc_cv.notify_one();
+            }
+        }
+    }
+    
+    std::generator<T&> used_objects() {
+        for (size_t i = 0; i < capacity; ++i) {
+            Entry& entry = pool[i];
+            std::lock_guard<std::mutex> lock(entry.mtx);
+            if (entry.state == ObjectState::IN_USE) {
+                co_yield *reinterpret_cast<T*>(entry.data);
+            }
+        }
+    }
+    size_t used_count() const { return used_count_atomic.load(); }
+    
+private:
+    Entry* get_entry(T* ptr) {
+        for (size_t i = 0; i < capacity; ++i) {
+            if (reinterpret_cast<T*>(pool[i].data) == ptr)
+                return &pool[i];
+        }
+        return nullptr;
+    }
+};
+
+// ---------------- Smart Ref Wrapper ----------------
 template<typename T, typename Pool>
 class Ref {
     T* ptr = nullptr;
@@ -420,7 +602,7 @@ public:
     explicit operator bool() const { return ptr != nullptr; }
 };
 
-// ---------------- Widget Test Type ----------------
+// ---------------- PMR-Enabled Test Type ----------------
 struct Widget {
     int id;
     std::pmr::vector<int> data;
@@ -434,14 +616,14 @@ struct Widget {
     }
 };
 
-// ---------------- Main ----------------
+// ---------------- Main Program ----------------
 int main() {
     Logger::log(Logger::Level::INFO, "--- Demonstrating UltraAllocator ---");
     UltraAllocator allocator(8192);
     void* a = allocator.allocate(512, "MeshData");
     void* b = allocator.allocate(1024, "TextureCache");
-
-        if (!allocator.validateIntegrity()) {
+    
+    if (!allocator.validateIntegrity()) {
         Logger::log(Logger::Level::ERROR, "Memory integrity check failed!");
     }
 
@@ -453,7 +635,6 @@ int main() {
     ObjectPool<Widget, VerbosePolicy> pool(4); // Start with a small pool to demonstrate scaling
     std::pmr::monotonic_buffer_resource pmr_res;
     std::vector<std::jthread> threads;
-
     for (int i = 0; i < 10; ++i) {
         threads.emplace_back([&, i] {
             auto result = pool.allocate(i, &pmr_res);
@@ -481,10 +662,11 @@ int main() {
         Logger::log(Logger::Level::INFO, "Live Widget ID: " + std::to_string(widget.id));
     }
 
-    Logger::log(Logger::Level::INFO, "Pool usage: " + std::to_string(pool.used_count()) + " / " + std::to_string(8));
+    Logger::log(Logger::Level::INFO, "Pool usage: " + std::to_string(pool.used_count()) + " / " + std::to_string(pool.capacity));
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     Logger::log(Logger::Level::INFO, "ObjectPool demo complete.\n");
 
     Logger::log(Logger::Level::INFO, "Program complete.");
     return 0;
+}
 }
