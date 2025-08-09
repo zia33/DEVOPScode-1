@@ -1,0 +1,70 @@
+Here are all the advanced features that have been integrated into the final, consolidated C++ source code.
+
+Integrated Feature List
+Core Memory Management
+
+Hierarchical Memory Allocator: A multi-tiered allocation strategy using a fast, thread-local, lock-free allocator for small objects and a more robust main allocator for larger requests.
+
+NUMA-Aware Memory Management: The allocator can partition its memory pool across different NUMA nodes to improve memory locality and performance on multi-socket systems.
+
+Memory-Mapped File Backing: Ability to use a file on disk as a backing store for the memory pool, enabling persistence and inter-process sharing.
+
+Pinned & Secure Enclave Memory: Supports allocating pinned (non-pageable) host memory for GPU interoperability and can simulate secure enclave memory protection.
+
+Manual Defragmentation: Provides a function to compact the memory pool, relocating objects to create larger contiguous free blocks.
+
+Polymorphic Memory Resource (PMR) Compatibility: Designed to work with C++17 std::pmr by providing memory for custom allocators.
+
+Garbage Collection & Object Lifecycle
+
+Concurrent, Incremental Garbage Collection: A background GC thread cleans up dereferenced objects without blocking application threads, processing items in small batches to minimize pause times.
+
+Generational GC (Simplified): Divides objects into "young" and "old" generations to optimize collection frequency.
+
+Memory Pressure-Driven GC: The garbage collector is automatically triggered when memory usage crosses a configurable high-water mark.
+
+Custom Finalizers: Allows custom cleanup logic to be attached to objects, which is executed just before they are destroyed by the GC.
+
+Reference Counting with Smart Pointers: A Ref<T> smart pointer class automates reference counting to manage object lifetimes.
+
+Performance and Optimization
+
+Configurable Locking Strategies: Uses C++ concepts to allow swapping different locking mechanisms (e.g., std::mutex, std::shared_mutex) via policies.
+
+Hardware Transactional Memory (HTM) Simulation: Includes a placeholder for using HTM for optimistic locking.
+
+Quality of Service (QoS) Guarantees: Allows allocations to be requested at different service tiers (BestEffort, Guaranteed, RealTime) to prioritize critical tasks.
+
+Built-in Benchmarking: A simple high-resolution timer for measuring the performance of allocation operations.
+
+Predictive Resource Scaling (ML Simulation): Includes a simulated machine learning model that analyzes telemetry to proactively trigger GC based on predicted memory pressure.
+
+Asynchronous and Distributed Capabilities
+
+Asynchronous I/O with Coroutines: Uses C++20 coroutines to perform non-blocking file I/O for persisting the memory pool state.
+
+Distributed Object Framework (Conceptual): Provides the foundational types (GlobalObjectID) and design patterns (DistributedObjectPool) for expanding the system into a multi-node, location-transparent object cache.
+
+Pluggable Communication Policies: A C++ concept defines an interface for network communication, allowing different protocols (e.g., TCP, RDMA) to be used in a distributed deployment.
+
+Security and Reliability
+
+Role-Based Access Control (RBAC) for Memory: An integrated security manager enforces rules on which parts of an application can Allocate, Read, or Write to specific memory pools.
+
+Secure Memory Wiping: Automatically overwrites memory with a specific pattern upon deallocation to prevent data remnant attacks.
+
+Rich Exception Hierarchy: A custom AllocationError class provides detailed context, including error codes and timestamps, when an operation fails.
+
+Graceful Degradation with Circuit Breakers: A CircuitBreaker component can detect repeated failures and temporarily halt operations to prevent system-wide collapse.
+
+Post-Mortem Analysis Framework: A global termination handler ensures that on a fatal, unhandled exception, a detailed report with allocator state is generated before aborting.
+
+Dynamic Logging and Auditing: A configurable logger routes messages to the console, and critical errors are sent to a simulated immutable audit service.
+
+Serviceability and Debugging
+
+Integrated Telemetry & Profiling: A background service collects and exports events (like allocation metrics) to a simulated external monitoring system.
+
+Live Introspection API (Simulated): A ManagementService demonstrates how the system could process commands from an external tool to report status or trigger actions (like GC) in a running process without downtime.
+
+C++23 Standards Compliance: Leverages modern C++ features like std::jthread, std::expected, std::generator, and concepts for safer and more expressive code.
